@@ -114,6 +114,8 @@ python main.py
 
 A janela mostra o vídeo da câmera, as caixas dos rostos detectados e os pontos/conexões da mão. Pressione `ESC` para sair.
 
+A análise é feita em `640x480`. O quadro é ampliado em 2x com `INTER_NEAREST` e exibido na janela em `1280x960`.
+
 ### Opções
 
 ```bash
@@ -140,6 +142,8 @@ Com a janela do vídeo em foco:
 | `ESC` | encerra o programa |
 
 O rastreamento automático usa o maior rosto detectado. A posição é suavizada e convertida gradualmente para ângulos entre 0 e 180 graus, com limite operacional normalizado de 80% para evitar os extremos mecânicos.
+
+O detector de mão usa o modo `VIDEO` do MediaPipe, mantendo o contexto entre quadros para reduzir o custo de processamento no Raspberry Pi e evitar que a captura fique acumulada.
 
 ## Protocolo serial
 

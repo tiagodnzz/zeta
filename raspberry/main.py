@@ -1,5 +1,6 @@
 import os
 import sys
+import threading
 import time
 import urllib.request
 
@@ -16,8 +17,9 @@ except ImportError:
 WINDOW_NAME = "Detector de rosto e mao"
 PROCESS_WIDTH = 640
 PROCESS_HEIGHT = 480
-WINDOW_HEIGHT = 720
-WINDOW_WIDTH = int(WINDOW_HEIGHT * PROCESS_WIDTH / PROCESS_HEIGHT)
+DISPLAY_SCALE = 2
+WINDOW_WIDTH = PROCESS_WIDTH * DISPLAY_SCALE
+WINDOW_HEIGHT = PROCESS_HEIGHT * DISPLAY_SCALE
 HAND_MODEL_PATH = os.path.join(os.getcwd(), "hand_landmarker.task")
 HAND_MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
@@ -52,6 +54,10 @@ FACE_TRACK_SMOOTHING = 0.35    # suaviza (EMA) a posicao do rosto entre quadros
 FACE_TRACK_DEADZONE = 0.06     # ignora desvios pequenos apos a suavizacao
 FACE_TRACK_EASE = 0.15         # fracao do erro corrigida por quadro (movimento suave)
 FACE_LOST_GRACE_FRAMES = 6     # mantem o ultimo alvo por alguns quadros ao perder o rosto
+# TFLite/XNNPACK satura todos os nucleos durante a inferencia, o que pode
+# impedir a thread de IPA da camera de rodar a tempo e travar capture_array().
+# Rodar a deteccao pesada a cada N quadros da folga de CPU para a captura.
+DETECTION_FRAME_INTERVAL = 1
 SERVO_KEYS = {
     2424832: (-1.0, 0.0),
     2555904: (1.0, 0.0),
@@ -142,6 +148,38 @@ def stop_servos(ser):
     ser.write(b"OFF\n")
 
 
+# Watchdog de diagnostico: identifica em qual etapa do loop o programa
+# ficou parado, sem depender de excecao ou de o usuario apertar Ctrl+C.
+_STAGE_STALL_THRESHOLD_S = 4.0
+_stage_lock = threading.Lock()
+_current_stage = {"name": "iniciando", "since": time.monotonic()}
+
+
+def _set_stage(name):
+    with _stage_lock:
+        _current_stage["name"] = name
+        _current_stage["since"] = time.monotonic()
+
+
+def _watchdog_loop(stop_event):
+    warned_stage = None
+    while not stop_event.is_set():
+        stop_event.wait(1.0)
+        with _stage_lock:
+            name = _current_stage["name"]
+            elapsed = time.monotonic() - _current_stage["since"]
+        if elapsed >= _STAGE_STALL_THRESHOLD_S:
+            if warned_stage != name:
+                print(
+                    f"Aviso: sem progresso ha {elapsed:.1f}s no estagio '{name}'; "
+                    "possivel travamento nesta etapa.",
+                    file=sys.stderr,
+                )
+                warned_stage = name
+        else:
+            warned_stage = None
+
+
 def find_face_cascade():
     """Locate OpenCV's frontal-face Haar cascade."""
     cascade_name = "haarcascade_frontalface_default.xml"
@@ -206,7 +244,7 @@ def create_hand_detector():
 
     options = vision.HandLandmarkerOptions(
         base_options=mp.tasks.BaseOptions(model_asset_path=HAND_MODEL_PATH),
-        running_mode=vision.RunningMode.IMAGE,
+        running_mode=vision.RunningMode.VIDEO,
         num_hands=1,
         min_hand_detection_confidence=0.5,
         min_hand_presence_confidence=0.5,
@@ -228,6 +266,7 @@ def draw_hand(frame, hand_landmarks):
 
 
 def main():
+    cv2.setNumThreads(1)  # evita que o OpenCV dispute nucleos com a thread de IPA da camera
     face_cascade = find_face_cascade() if DETECTION_ENABLED else None
     hand_detector = create_hand_detector() if DETECTION_ENABLED else None
     ser = create_servos()
@@ -241,6 +280,13 @@ def main():
     }
     detach_at = None
     camera = None
+    last_hand_timestamp_ms = 0
+    frame_index = 0
+    last_faces = ()
+    last_hand_landmarks = None
+    watchdog_stop = threading.Event()
+    watchdog_thread = threading.Thread(target=_watchdog_loop, args=(watchdog_stop,), daemon=True)
+    watchdog_thread.start()
 
     try:
         camera = Picamera2()
@@ -262,10 +308,12 @@ def main():
             print("Entrada de camera tratada como RGB puro.")
 
         while True:
+            _set_stage("captura_camera")
             captured_frame = camera.capture_array()
             if captured_frame is None:
                 break
 
+            _set_stage("conversao_cor")
             if FORCE_RGB_INPUT:
                 frame_rgb = captured_frame
                 frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
@@ -278,54 +326,85 @@ def main():
             frame_bgr = cv2.rotate(frame_bgr, cv2.ROTATE_180)
             frame_bgr = cv2.flip(frame_bgr, 1)
             detected = False
+            frame_index += 1
+            run_detection_this_frame = DETECTION_ENABLED and (
+                frame_index % DETECTION_FRAME_INTERVAL == 0
+            )
 
-            if DETECTION_ENABLED:
-                image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
-                hand_results = hand_detector.detect(image)
-                if hand_results.hand_landmarks:
-                    draw_hand(frame_bgr, hand_results.hand_landmarks[0])
-                    detected = True
+            if run_detection_this_frame:
+                try:
+                    _set_stage("deteccao_mao")
+                    image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+                    # O MediaPipe exige timestamps estritamente crescentes; usar so
+                    # time.monotonic() pode gerar o mesmo milissegundo em quadros
+                    # seguidos e derrubar o processo com excecao nao tratada.
+                    timestamp_ms = max(int(time.monotonic() * 1000), last_hand_timestamp_ms + 1)
+                    last_hand_timestamp_ms = timestamp_ms
+                    hand_results = hand_detector.detect_for_video(image, timestamp_ms)
+                    if hand_results.hand_landmarks:
+                        draw_hand(frame_bgr, hand_results.hand_landmarks[0])
+                        detected = True
+                        last_hand_landmarks = hand_results.hand_landmarks[0]
+                    else:
+                        last_hand_landmarks = None
 
-                gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-                faces = face_cascade.detectMultiScale(
-                    gray,
-                    scaleFactor=1.1,
-                    minNeighbors=5,
-                    minSize=(40, 40),
-                )
-                for x, y, width, height in faces:
-                    cv2.rectangle(
-                        frame_bgr,
-                        (x, y),
-                        (x + width, y + height),
-                        (255, 0, 0),
-                        2,
+                    _set_stage("deteccao_rosto")
+                    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+                    faces = face_cascade.detectMultiScale(
+                        gray,
+                        scaleFactor=1.1,
+                        minNeighbors=5,
+                        minSize=(40, 40),
                     )
-                detected = detected or len(faces) > 0
-
-                if FACE_TRACK_ENABLED and detach_at is None:
-                    if len(faces) > 0:
-                        largest_face = max(faces, key=lambda face: face[2] * face[3])
-                        servo_state["lost_frames"] = 0
-                        update_face_tracking(
-                            ser, servo_state, face_bbox_to_target(largest_face, PROCESS_WIDTH, PROCESS_HEIGHT)
+                    for x, y, width, height in faces:
+                        cv2.rectangle(
+                            frame_bgr,
+                            (x, y),
+                            (x + width, y + height),
+                            (255, 0, 0),
+                            2,
                         )
-                    elif (
-                        servo_state["smoothed_x"] is not None
-                        and servo_state["lost_frames"] < FACE_LOST_GRACE_FRAMES
-                    ):
-                        servo_state["lost_frames"] += 1
-                        update_face_tracking(
-                            ser, servo_state, (servo_state["smoothed_x"], servo_state["smoothed_y"])
-                        )
+                    detected = detected or len(faces) > 0
+                    last_faces = faces
 
-                # MediaPipe 1.0.1 libera esses buffers via GC; remova as
-                # referencias imediatamente para evitar acumulo durante a captura.
-                del hand_results, image
+                    _set_stage("rastreamento_servos")
+                    if FACE_TRACK_ENABLED and detach_at is None:
+                        if len(faces) > 0:
+                            largest_face = max(faces, key=lambda face: face[2] * face[3])
+                            servo_state["lost_frames"] = 0
+                            update_face_tracking(
+                                ser, servo_state, face_bbox_to_target(
+                                    largest_face, frame_bgr.shape[1], frame_bgr.shape[0]
+                                )
+                            )
+                        elif (
+                            servo_state["smoothed_x"] is not None
+                            and servo_state["lost_frames"] < FACE_LOST_GRACE_FRAMES
+                        ):
+                            servo_state["lost_frames"] += 1
+                            update_face_tracking(
+                                ser, servo_state, (servo_state["smoothed_x"], servo_state["smoothed_y"])
+                            )
+
+                    # MediaPipe 1.0.1 libera esses buffers via GC; remova as
+                    # referencias imediatamente para evitar acumulo durante a captura.
+                    del hand_results, image
+                except Exception as detection_error:
+                    # Uma falha pontual de deteccao nao pode derrubar o loop
+                    # principal, senao a janela congela e os servos param.
+                    print(f"Aviso: deteccao falhou neste quadro: {detection_error}", file=sys.stderr)
+            elif DETECTION_ENABLED:
+                # Reaproveita o ultimo resultado nos quadros sem deteccao pesada,
+                # so para manter a sobreposicao visual sem piscar.
+                for x, y, width, height in last_faces:
+                    cv2.rectangle(frame_bgr, (x, y), (x + width, y + height), (255, 0, 0), 2)
+                if last_hand_landmarks is not None:
+                    draw_hand(frame_bgr, last_hand_landmarks)
 
             display_frame = cv2.resize(
                 frame_bgr, (WINDOW_WIDTH, WINDOW_HEIGHT), interpolation=cv2.INTER_NEAREST
             )
+            _set_stage("exibicao_janela")
             cv2.imshow(WINDOW_NAME, display_frame)
             key = cv2.waitKeyEx(20)
             if key == 27:
@@ -349,6 +428,7 @@ def main():
                 stop_servos(ser)
                 detach_at = None
     finally:
+        watchdog_stop.set()
         if hand_detector is not None:
             hand_detector.close()
         if camera is not None:
