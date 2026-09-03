@@ -1,2 +1,5 @@
 mediapipe
 pyserial
+numpy
+# Requer IMX500 firmware (sudo apt install imx500-all) + reboot antes de instalar.
+modlib

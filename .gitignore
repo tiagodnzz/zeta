@@ -1,0 +1,19 @@
+# Python cache and local environments
+__pycache__/
+*.py[cod]
+.venv/
+.venv-*/
+
+# PlatformIO build output and local IDE metadata
+.pio/
+.vscode/c_cpp_properties.json
+.vscode/launch.json
+
+# Local ML model artifacts
+*.pt
+*.onnx
+*.pbtxt
+*.rpk
+*MemoryReport.json
+raspberry/yolo11n-pose_imx_model/
+raspberry/yolo11n-pose_rpk/
