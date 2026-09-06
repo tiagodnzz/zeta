@@ -3,10 +3,15 @@ import sys
 import threading
 import time
 import urllib.request
+from datetime import datetime
 
 import cv2
 import serial
 from picamera2 import Picamera2
+try:
+    from ultralytics import YOLO
+except ImportError:
+    YOLO = None
 
 try:
     import mediapipe as mp
@@ -14,7 +19,7 @@ except ImportError:
     mp = None
 
 
-WINDOW_NAME = "Detector de rosto e mao"
+WINDOW_NAME = "Visão do Zeta"
 PROCESS_WIDTH = 640
 PROCESS_HEIGHT = 480
 DISPLAY_SCALE = 2
@@ -25,6 +30,7 @@ HAND_MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
     "hand_landmarker/float16/1/hand_landmarker.task"
 )
+OBJECT_MODEL_PATH = os.path.join(os.path.dirname(__file__), "yolo11n.pt")
 HAND_CONNECTIONS = (
     (0, 1), (1, 2), (2, 3), (3, 4),
     (0, 5), (5, 6), (6, 7), (7, 8),
@@ -54,10 +60,18 @@ FACE_TRACK_SMOOTHING = 0.35    # suaviza (EMA) a posicao do rosto entre quadros
 FACE_TRACK_DEADZONE = 0.06     # ignora desvios pequenos apos a suavizacao
 FACE_TRACK_EASE = 0.15         # fracao do erro corrigida por quadro (movimento suave)
 FACE_LOST_GRACE_FRAMES = 6     # mantem o ultimo alvo por alguns quadros ao perder o rosto
+ROBOT_MODES = (
+    "FOLLOW_HAND", "FOLLOW_FACE", "COUNT_FINGERS", "OBJECT_DETECTION", "DATE_TIME", "DRAWING",
+)
+DEFAULT_MODE = "FOLLOW_FACE"
+GESTURE_REQUIRED_FRAMES = 6
+GESTURE_COOLDOWN_S = 0.8
+MENU_IDLE_TIMEOUT_S = 8.0
 # TFLite/XNNPACK satura todos os nucleos durante a inferencia, o que pode
 # impedir a thread de IPA da camera de rodar a tempo e travar capture_array().
 # Rodar a deteccao pesada a cada N quadros da folga de CPU para a captura.
 DETECTION_FRAME_INTERVAL = 1
+OBJECT_DISPLAY_DELAY_S = 0.5  # atualiza as caixas de objetos no maximo duas vezes por segundo
 SERVO_KEYS = {
     2424832: (-1.0, 0.0),
     2555904: (1.0, 0.0),
@@ -146,6 +160,41 @@ def update_face_tracking(ser, state, target):
 
 def stop_servos(ser):
     ser.write(b"OFF\n")
+
+
+def send_robot_command(ser, command):
+    """Envia uma mensagem de alto nivel para a interface do ESP32."""
+    try:
+        ser.write(f"{command}\n".encode("ascii"))
+    except serial.SerialTimeoutException:
+        print(f"Aviso: comando '{command}' expirou.", file=sys.stderr)
+
+
+def send_status_text(ser, text):
+    send_robot_command(ser, "STATUS:TEXT:" + text[:48])
+
+
+def open_robot_menu(ser):
+    send_robot_command(ser, "MODE:MENU")
+
+
+MODE_INTRO_TEXT = {
+    "FOLLOW_HAND": "Seguindo sua mao",
+    "FOLLOW_FACE": "Seguindo seu rosto",
+    "COUNT_FINGERS": "Contando dedos",
+    "OBJECT_DETECTION": "Procurando objetos",
+    "DATE_TIME": "Vendo as horas",
+    "DRAWING": "Modo desenho",
+}
+
+
+def select_robot_mode(ser, mode):
+    if mode not in ROBOT_MODES and mode != "FACE":
+        return
+    display_mode = "FACE" if mode in ("FOLLOW_HAND", "FOLLOW_FACE", "FACE") else mode
+    send_robot_command(ser, f"MODE:{display_mode}")
+    if mode in MODE_INTRO_TEXT:
+        send_status_text(ser, MODE_INTRO_TEXT[mode])
 
 
 # Watchdog de diagnostico: identifica em qual etapa do loop o programa
@@ -252,6 +301,41 @@ def create_hand_detector():
     return vision.HandLandmarker.create_from_options(options)
 
 
+def create_object_detector():
+    if YOLO is None:
+        raise RuntimeError("Ultralytics nao esta instalado para o modo de objetos.")
+    if not os.path.exists(OBJECT_MODEL_PATH):
+        raise FileNotFoundError(f"Modelo de objetos ausente: {OBJECT_MODEL_PATH}")
+    return YOLO(OBJECT_MODEL_PATH)
+
+
+def detect_objects(model, frame):
+    results = model.predict(frame, imgsz=320, conf=0.35, verbose=False)
+    detections = []
+    for result in results:
+        for box in result.boxes:
+            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+            class_id = int(box.cls[0])
+            confidence = float(box.conf[0])
+            label = result.names[class_id]
+            detections.append((x1, y1, x2, y2, label, confidence))
+    return detections
+
+
+def draw_object_detections(frame, detections):
+    for x1, y1, x2, y2, label, confidence in detections:
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 165, 255), 2)
+        cv2.putText(
+            frame,
+            f"{label} {confidence:.2f}",
+            (x1, max(20, y1 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (0, 165, 255),
+            2,
+        )
+
+
 def draw_hand(frame, hand_landmarks):
     height, width = frame.shape[:2]
     points = [
@@ -264,11 +348,101 @@ def draw_hand(frame, hand_landmarks):
     for point in points:
         cv2.circle(frame, point, 5, (0, 0, 255), -1)
 
+    x_values = [point[0] for point in points]
+    y_values = [point[1] for point in points]
+    x_min = max(0, min(x_values) - 12)
+    y_min = max(0, min(y_values) - 12)
+    x_max = min(width - 1, max(x_values) + 12)
+    y_max = min(height - 1, max(y_values) + 12)
+    cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
+    cv2.putText(
+        frame,
+        "Mao",
+        (x_min, max(22, y_min - 8)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (0, 255, 0),
+        2,
+        cv2.LINE_AA,
+    )
+
+
+def draw_board(frame, drawing):
+    """Desenha os tracos persistentes como linhas continuas."""
+    previous_point = None
+    for point in drawing:
+        if point is None:
+            previous_point = None
+            continue
+        if previous_point is not None:
+            cv2.line(frame, previous_point, point, (0, 0, 255), 5, cv2.LINE_AA)
+        previous_point = point
+
+
+def count_extended_fingers(hand_landmarks, handedness=None):
+    """Estima dedos estendidos, tratando o polegar conforme a mao detectada."""
+    tips = (8, 12, 16, 20)
+    pips = (6, 10, 14, 18)
+    extended = sum(hand_landmarks[tip].y < hand_landmarks[pip].y for tip, pip in zip(tips, pips))
+    thumb_tip = hand_landmarks[4]
+    thumb_ip = hand_landmarks[3]
+    thumb_mcp = hand_landmarks[2]
+    palm_width = abs(hand_landmarks[5].x - hand_landmarks[17].x)
+    thumb_reach = abs(thumb_tip.x - thumb_mcp.x)
+    thumb_extended = thumb_reach > palm_width * 0.35
+    return extended + int(thumb_extended)
+
+
+def classify_hand_gesture(hand_landmarks):
+    finger_extended = [
+        hand_landmarks[tip].y < hand_landmarks[pip].y - 0.02
+        for tip, pip in zip((8, 12, 16, 20), (6, 10, 14, 18))
+    ]
+    non_thumb_count = sum(finger_extended)
+    if finger_extended[0] and finger_extended[1] and not any(finger_extended[2:]):
+        return "peace"
+    if non_thumb_count >= 3:
+        return "open_palm"
+    if non_thumb_count == 0:
+        thumb_tip = hand_landmarks[4]
+        thumb_ip = hand_landmarks[3]
+        if thumb_tip.y < thumb_ip.y - 0.04:
+            return "thumbs_up"
+        if thumb_tip.y > hand_landmarks[0].y + 0.04:
+            return "thumbs_down"
+        return "closed_fist"
+    index_tip = hand_landmarks[8]
+    wrist = hand_landmarks[0]
+    index_pip = hand_landmarks[6]
+    index_is_extended = index_tip.y < index_pip.y - 0.03
+    horizontal_reach = abs(index_tip.x - wrist.x)
+    vertical_reach = wrist.y - index_tip.y
+    if non_thumb_count == 1 and index_is_extended and vertical_reach > 0.12:
+        return "point_up_right" if wrist.x >= 0.5 else "point_up_left"
+    if non_thumb_count <= 2 and index_is_extended and horizontal_reach > 0.12:
+        return "point_up_right" if wrist.x >= 0.5 else "point_up_left"
+    return "none"
+
+
+class GestureStabilizer:
+    def __init__(self):
+        self.last = None
+        self.frames = 0
+
+    def update(self, gesture):
+        if gesture == self.last:
+            self.frames += 1
+        else:
+            self.last = gesture
+            self.frames = 1
+        return gesture if self.frames == GESTURE_REQUIRED_FRAMES else None
+
 
 def main():
     cv2.setNumThreads(1)  # evita que o OpenCV dispute nucleos com a thread de IPA da camera
     face_cascade = find_face_cascade() if DETECTION_ENABLED else None
     hand_detector = create_hand_detector() if DETECTION_ENABLED else None
+    object_detector = None
     ser = create_servos()
     servo_state = {
         "x": 0.0,
@@ -284,6 +458,22 @@ def main():
     frame_index = 0
     last_faces = ()
     last_hand_landmarks = None
+    menu_index = 0
+    menu_visible = False
+    last_menu_interaction = 0.0
+    robot_mode = DEFAULT_MODE
+    gesture_stabilizer = GestureStabilizer()
+    last_gesture_action = 0.0
+    visible_gesture = "none"
+    visible_finger_count = 0
+    visible_object_detections = []
+    drawing = []
+    last_object_display = 0.0
+    last_object_status_text = None
+    last_status_send = 0.0
+    finger_candidate_count = None
+    finger_candidate_since = 0.0
+    last_finger_status_count = None
     watchdog_stop = threading.Event()
     watchdog_thread = threading.Thread(target=_watchdog_loop, args=(watchdog_stop,), daemon=True)
     watchdog_thread.start()
@@ -300,6 +490,8 @@ def main():
         cv2.resizeWindow(WINDOW_NAME, WINDOW_WIDTH, WINDOW_HEIGHT)
 
         print("Reconhecimento ativo; controle manual por WASD ou setas. ESC para sair.")
+        select_robot_mode(ser, robot_mode)
+        print("Teste do menu: M abre; 1-6 selecionam uma funcao; F retorna ao rosto.")
         if not DETECTION_ENABLED:
             print("Deteccao desativada.")
         if not FACE_TRACK_ENABLED:
@@ -342,19 +534,77 @@ def main():
                     last_hand_timestamp_ms = timestamp_ms
                     hand_results = hand_detector.detect_for_video(image, timestamp_ms)
                     if hand_results.hand_landmarks:
-                        draw_hand(frame_bgr, hand_results.hand_landmarks[0])
+                        current_hand = hand_results.hand_landmarks[0]
+                        handedness = None
+                        if hand_results.handedness and hand_results.handedness[0]:
+                            handedness = hand_results.handedness[0][0].category_name
+                        draw_hand(frame_bgr, current_hand)
                         detected = True
-                        last_hand_landmarks = hand_results.hand_landmarks[0]
+                        last_hand_landmarks = current_hand
+                        visible_finger_count = count_extended_fingers(current_hand, handedness)
+                        visible_gesture = classify_hand_gesture(current_hand)
+                        if robot_mode == "DRAWING":
+                            if visible_finger_count == 1:
+                                drawing.append(
+                                    (int(current_hand[8].x * frame_bgr.shape[1]),
+                                     int(current_hand[8].y * frame_bgr.shape[0]))
+                                )
+                            elif visible_finger_count == 3:
+                                drawing.clear()
+                            elif drawing and drawing[-1] is not None:
+                                drawing.append(None)
+                        stable_gesture = gesture_stabilizer.update(
+                            visible_gesture
+                        )
+                        now = time.monotonic()
+                        if stable_gesture and now - last_gesture_action >= GESTURE_COOLDOWN_S:
+                            if not menu_visible and stable_gesture == "peace":
+                                robot_mode = DEFAULT_MODE
+                                menu_index = ROBOT_MODES.index(DEFAULT_MODE)
+                                open_robot_menu(ser)
+                                menu_visible = True
+                                last_menu_interaction = now
+                                last_gesture_action = now
+                            elif menu_visible and stable_gesture == "point_up_left":
+                                menu_index = (menu_index + 1) % len(ROBOT_MODES)
+                                send_robot_command(ser, f"MENU:INDEX:{menu_index}")
+                                last_menu_interaction = now
+                                last_gesture_action = now
+                            elif menu_visible and stable_gesture == "point_up_right":
+                                menu_index = (menu_index - 1) % len(ROBOT_MODES)
+                                send_robot_command(ser, f"MENU:INDEX:{menu_index}")
+                                last_menu_interaction = now
+                                last_gesture_action = now
+                            elif menu_visible and stable_gesture in ("thumbs_up", "closed_fist"):
+                                send_robot_command(ser, "MENU:CONFIRM")
+                                robot_mode = ROBOT_MODES[menu_index]
+                                if robot_mode == "DRAWING":
+                                    drawing.clear()
+                                servo_state["lost_frames"] = 0
+                                detach_at = None
+                                select_robot_mode(ser, robot_mode)
+                                menu_visible = False
+                                last_gesture_action = now
+                            elif menu_visible and stable_gesture == "thumbs_down":
+                                send_robot_command(ser, "MENU:CANCEL")
+                                menu_visible = False
+                                last_gesture_action = now
                     else:
                         last_hand_landmarks = None
+                        visible_gesture = "none"
+                        visible_finger_count = 0
+                        if robot_mode == "DRAWING" and drawing and drawing[-1] is not None:
+                            drawing.append(None)
+                        gesture_stabilizer.update("none")
+
+                    if menu_visible and time.monotonic() - last_menu_interaction >= MENU_IDLE_TIMEOUT_S:
+                        send_robot_command(ser, "MODE:FACE")
+                        menu_visible = False
 
                     _set_stage("deteccao_rosto")
                     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-                    faces = face_cascade.detectMultiScale(
-                        gray,
-                        scaleFactor=1.1,
-                        minNeighbors=5,
-                        minSize=(40, 40),
+                    faces = () if robot_mode == "OBJECT_DETECTION" else face_cascade.detectMultiScale(
+                        gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40)
                     )
                     for x, y, width, height in faces:
                         cv2.rectangle(
@@ -364,11 +614,41 @@ def main():
                             (255, 0, 0),
                             2,
                         )
+                        cv2.putText(
+                            frame_bgr,
+                            "Humano",
+                            (x, max(22, y - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.7,
+                            (255, 0, 0),
+                            2,
+                            cv2.LINE_AA,
+                        )
                     detected = detected or len(faces) > 0
                     last_faces = faces
 
+                    if robot_mode == "OBJECT_DETECTION":
+                        _set_stage("deteccao_objetos")
+                        if object_detector is None:
+                            object_detector = create_object_detector()
+                        object_detections = detect_objects(object_detector, frame_bgr)
+                        now = time.monotonic()
+                        if now - last_object_display >= OBJECT_DISPLAY_DELAY_S:
+                            visible_object_detections = object_detections
+                            last_object_display = now
+                        labels = [detection[4] for detection in object_detections]
+                        object_status_text = "Objetos: " + ", ".join(sorted(set(labels))) if labels else None
+                        if (
+                            object_status_text
+                            and object_status_text != last_object_status_text
+                            and now - last_status_send >= 1.0
+                        ):
+                            send_status_text(ser, object_status_text)
+                            last_object_status_text = object_status_text
+                            last_status_send = now
+
                     _set_stage("rastreamento_servos")
-                    if FACE_TRACK_ENABLED and detach_at is None:
+                    if robot_mode == "FOLLOW_FACE" and FACE_TRACK_ENABLED and detach_at is None:
                         if len(faces) > 0:
                             largest_face = max(faces, key=lambda face: face[2] * face[3])
                             servo_state["lost_frames"] = 0
@@ -385,6 +665,33 @@ def main():
                             update_face_tracking(
                                 ser, servo_state, (servo_state["smoothed_x"], servo_state["smoothed_y"])
                             )
+                    if robot_mode == "FOLLOW_HAND" and last_hand_landmarks is not None:
+                        hand_tip = last_hand_landmarks[8]
+                        update_face_tracking(
+                            ser, servo_state,
+                            (hand_tip.x * 2 - 1, hand_tip.y * 2 - 1),
+                        )
+                    now = time.monotonic()
+                    if robot_mode == "COUNT_FINGERS" and last_hand_landmarks is not None:
+                        if visible_finger_count != finger_candidate_count:
+                            finger_candidate_count = visible_finger_count
+                            finger_candidate_since = now
+                        elif (
+                            now - finger_candidate_since >= 0.4
+                            and visible_finger_count != last_finger_status_count
+                        ):
+                            send_robot_command(ser, f"STATUS:FINGERS:{visible_finger_count}")
+                            last_finger_status_count = visible_finger_count
+                    elif robot_mode == "COUNT_FINGERS":
+                        if finger_candidate_count != 0:
+                            finger_candidate_count = 0
+                            finger_candidate_since = now
+                        elif now - finger_candidate_since >= 0.4 and last_finger_status_count != 0:
+                            send_robot_command(ser, "STATUS:FINGERS:0")
+                            last_finger_status_count = 0
+                    elif robot_mode == "DATE_TIME" and now - last_status_send >= 1.0:
+                        send_status_text(ser, datetime.now().strftime("%d/%m/%Y  %H:%M"))
+                        last_status_send = now
 
                     # MediaPipe 1.0.1 libera esses buffers via GC; remova as
                     # referencias imediatamente para evitar acumulo durante a captura.
@@ -398,17 +705,63 @@ def main():
                 # so para manter a sobreposicao visual sem piscar.
                 for x, y, width, height in last_faces:
                     cv2.rectangle(frame_bgr, (x, y), (x + width, y + height), (255, 0, 0), 2)
+                    cv2.putText(
+                        frame_bgr,
+                        "Humano",
+                        (x, max(22, y - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (255, 0, 0),
+                        2,
+                        cv2.LINE_AA,
+                    )
                 if last_hand_landmarks is not None:
                     draw_hand(frame_bgr, last_hand_landmarks)
 
+            if robot_mode == "OBJECT_DETECTION":
+                draw_object_detections(frame_bgr, visible_object_detections)
+            elif robot_mode == "DRAWING":
+                draw_board(frame_bgr, drawing)
+
             display_frame = cv2.resize(
                 frame_bgr, (WINDOW_WIDTH, WINDOW_HEIGHT), interpolation=cv2.INTER_NEAREST
+            )
+            cv2.putText(
+                display_frame,
+                f"gesto: {visible_gesture}  dedos: {visible_finger_count}",
+                (16, 32),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 255, 255),
+                2,
+                cv2.LINE_AA,
             )
             _set_stage("exibicao_janela")
             cv2.imshow(WINDOW_NAME, display_frame)
             key = cv2.waitKeyEx(20)
             if key == 27:
                 break
+            normalized_key = key & 0xFF
+            if normalized_key in (ord("m"), ord("M")):
+                robot_mode = DEFAULT_MODE
+                menu_index = ROBOT_MODES.index(DEFAULT_MODE)
+                open_robot_menu(ser)
+                menu_visible = True
+                last_menu_interaction = time.monotonic()
+                continue
+            if normalized_key in (ord("f"), ord("F")):
+                robot_mode = DEFAULT_MODE
+                select_robot_mode(ser, "FACE")
+                continue
+            if normalized_key in (ord("1"), ord("2"), ord("3"), ord("4"), ord("5"), ord("6")):
+                menu_index = int(chr(normalized_key)) - 1
+                send_robot_command(ser, f"MENU:INDEX:{menu_index}")
+                robot_mode = ROBOT_MODES[menu_index]
+                if robot_mode == "DRAWING":
+                    drawing.clear()
+                select_robot_mode(ser, robot_mode)
+                menu_visible = False
+                continue
             if key & 0xFF == ord(" "):
                 stop_servos(ser)
                 detach_at = None
@@ -416,7 +769,6 @@ def main():
                 continue
             # Alguns backends retornam teclas com bits extras; o byte baixo
             # preserva o codigo ASCII de W, A, S e D.
-            normalized_key = key & 0xFF
             movement = SERVO_KEYS.get(key, SERVO_KEYS.get(normalized_key))
             if movement is not None:
                 move_servos_manually(ser, servo_state, *movement)
