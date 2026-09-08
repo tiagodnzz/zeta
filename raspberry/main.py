@@ -1,9 +1,19 @@
 import os
+import json
+import queue
+import shutil
 import sys
+import subprocess
 import threading
 import time
+import urllib.error
 import urllib.request
+from urllib.parse import urlparse
+import unicodedata
 from datetime import datetime
+
+os.environ.setdefault("GLOG_minloglevel", "2")
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 
 import cv2
 import serial
@@ -51,6 +61,18 @@ SERIAL_PORT = "/dev/ttyUSB0"
 SERIAL_BAUD = 115200
 SERIAL_WRITE_TIMEOUT = 0.2
 SERVO_SEND_INTERVAL = 0.05
+
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434/api/chat")
+OLLAMA_MODEL = os.environ.get(
+    "OLLAMA_MODEL", # llama3.2:3b qwen2.5:3b - gemma3:4b - gemma3:1b
+    os.environ.get("OLLAMA_MODAL", "qwen2.5:3b"),
+)
+OLLAMA_TIMEOUT_S = float(os.environ.get("OLLAMA_TIMEOUT_S", "180"))
+OLLAMA_START_TIMEOUT_S = float(os.environ.get("OLLAMA_START_TIMEOUT_S", "15"))
+OLLAMA_CONTEXT = (
+    "Voce e o Zeta, um robo simpatico. Responda em portugues, de forma breve "
+    "e natural, usando no maximo 240 caracteres."
+)
 
 SERVO_LIMIT = 0.8          # mesmo limite normalizado de -1.0 a 1.0
 MANUAL_SERVO_STEP = 0.025
@@ -171,7 +193,168 @@ def send_robot_command(ser, command):
 
 
 def send_status_text(ser, text):
-    send_robot_command(ser, "STATUS:TEXT:" + text[:48])
+    clean_text = " ".join(str(text).replace("\n", " ").replace("\r", " ").split())
+    # O firmware usa a fonte ASCII do TFT; descarte apenas os diacriticos
+    # combinados para transformar "nao" sem gerar "na?".
+    clean_text = unicodedata.normalize("NFKD", clean_text).encode("ascii", "ignore").decode("ascii")
+    send_robot_command(ser, "STATUS:TEXT:" + clean_text[:120])
+
+
+def ensure_ollama_server():
+    """Ensure the local Ollama API is ready without starting duplicate servers."""
+    tags_url = OLLAMA_URL.rsplit("/api/", 1)[0] + "/api/tags"
+    try:
+        with urllib.request.urlopen(tags_url, timeout=1.0):
+            print(f"Ollama pronto. Modelo configurado: {OLLAMA_MODEL}")
+            return
+    except (OSError, urllib.error.URLError):
+        pass
+
+    ollama_host = urlparse(OLLAMA_URL).hostname
+    if ollama_host not in ("127.0.0.1", "localhost", "::1"):
+        print(f"Aviso: Ollama nao respondeu em {tags_url}.", file=sys.stderr)
+        return
+
+    ollama_executable = shutil.which("ollama")
+    if ollama_executable is None:
+        print(
+            "Aviso: executavel 'ollama' nao encontrado; o chat ficara indisponivel.",
+            file=sys.stderr,
+        )
+        return
+
+    print("Ollama nao esta ativo. Iniciando ollama serve...")
+    try:
+        subprocess.Popen(
+            [ollama_executable, "serve"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as error:
+        print(f"Aviso: nao foi possivel iniciar o Ollama: {error}", file=sys.stderr)
+        return
+
+    deadline = time.monotonic() + OLLAMA_START_TIMEOUT_S
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(tags_url, timeout=1.0):
+                print(f"Ollama pronto. Modelo configurado: {OLLAMA_MODEL}")
+                return
+        except (OSError, urllib.error.URLError):
+            time.sleep(0.25)
+    print("Aviso: Ollama nao iniciou dentro do tempo esperado.", file=sys.stderr)
+
+
+def ask_ollama(prompt):
+    ollama_executable = shutil.which("ollama")
+    if ollama_executable is not None:
+        cli_prompt = f"{OLLAMA_CONTEXT}\nUsuario: {prompt}\nZeta:"
+        try:
+            result = subprocess.run(
+                [ollama_executable, "run", OLLAMA_MODEL, cli_prompt],
+                capture_output=True,
+                text=True,
+                timeout=OLLAMA_TIMEOUT_S,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError("ollama run excedeu o tempo limite") from error
+        if result.returncode != 0:
+            error_text = result.stderr.strip() or result.stdout.strip()
+            raise RuntimeError(error_text or f"ollama run saiu com codigo {result.returncode}")
+        response = result.stdout.strip()
+        if response:
+            return response
+
+    chat_body = json.dumps(
+        {
+            "model": OLLAMA_MODEL,
+            "stream": False,
+            "messages": [
+                {"role": "system", "content": OLLAMA_CONTEXT},
+                {"role": "user", "content": prompt},
+            ],
+        }
+    ).encode("utf-8")
+    try:
+        request = urllib.request.Request(
+            OLLAMA_URL,
+            data=chat_body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=OLLAMA_TIMEOUT_S) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        return payload["message"]["content"].strip()
+    except urllib.error.HTTPError as error:
+        error_body = error.read().decode("utf-8", errors="replace").strip()
+        if error.code != 404:
+            raise RuntimeError(f"HTTP {error.code}: {error_body or error.reason}") from error
+
+        generate_url = OLLAMA_URL.rsplit("/api/", 1)[0] + "/api/generate"
+        generate_body = json.dumps(
+            {
+                "model": OLLAMA_MODEL,
+                "prompt": f"{OLLAMA_CONTEXT}\nUsuario: {prompt}\nZeta:",
+                "stream": False,
+            }
+        ).encode("utf-8")
+        fallback_request = urllib.request.Request(
+            generate_url,
+            data=generate_body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(fallback_request, timeout=OLLAMA_TIMEOUT_S) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as fallback_error:
+            fallback_body = fallback_error.read().decode("utf-8", errors="replace").strip()
+            raise RuntimeError(
+                f"chat HTTP {error.code}: {error_body or error.reason}; "
+                f"generate HTTP {fallback_error.code}: {fallback_body or fallback_error.reason}"
+            ) from fallback_error
+        return payload["response"].strip()
+
+
+def ollama_worker(ser, prompt_queue, stop_event, inference_active):
+    while not stop_event.is_set():
+        try:
+            prompt = prompt_queue.get(timeout=0.2)
+        except queue.Empty:
+            continue
+        try:
+            print(f"Voce: {prompt}")
+            send_status_text(ser, "Pensando...")
+            inference_active.set()
+            response = ask_ollama(prompt)
+            if not response:
+                response = "Nao consegui responder agora."
+            print(f"Zeta: {response}")
+            send_status_text(ser, response)
+        except Exception as error:
+            print(f"Aviso: Ollama indisponivel: {error}", file=sys.stderr)
+            send_status_text(ser, "Nao consegui falar com o Ollama.")
+        finally:
+            inference_active.clear()
+            prompt_queue.task_done()
+
+
+def keyboard_chat_input(prompt_queue, stop_event):
+    print("Chat ativo. Digite uma mensagem e pressione Enter.")
+    while not stop_event.is_set():
+        try:
+            prompt = input("Voce> ").strip()
+        except (EOFError, OSError):
+            return
+        if not prompt:
+            continue
+        try:
+            prompt_queue.put_nowait(prompt)
+            print("Zeta esta pensando...")
+        except queue.Full:
+            print("Zeta ainda esta respondendo; aguarde.")
 
 
 def open_robot_menu(ser):
@@ -440,6 +623,7 @@ class GestureStabilizer:
 
 def main():
     cv2.setNumThreads(1)  # evita que o OpenCV dispute nucleos com a thread de IPA da camera
+    ensure_ollama_server()
     face_cascade = find_face_cascade() if DETECTION_ENABLED else None
     hand_detector = create_hand_detector() if DETECTION_ENABLED else None
     object_detector = None
@@ -471,12 +655,25 @@ def main():
     last_object_display = 0.0
     last_object_status_text = None
     last_status_send = 0.0
+    chat_queue = queue.Queue(maxsize=1)
+    chat_stop = threading.Event()
+    ollama_inference_active = threading.Event()
+    chat_worker_thread = threading.Thread(
+        target=ollama_worker,
+        args=(ser, chat_queue, chat_stop, ollama_inference_active),
+        daemon=True,
+    )
+    chat_input_thread = threading.Thread(
+        target=keyboard_chat_input, args=(chat_queue, chat_stop), daemon=True
+    )
     finger_candidate_count = None
     finger_candidate_since = 0.0
     last_finger_status_count = None
     watchdog_stop = threading.Event()
     watchdog_thread = threading.Thread(target=_watchdog_loop, args=(watchdog_stop,), daemon=True)
     watchdog_thread.start()
+    chat_worker_thread.start()
+    chat_input_thread.start()
 
     try:
         camera = Picamera2()
@@ -521,7 +718,7 @@ def main():
             frame_index += 1
             run_detection_this_frame = DETECTION_ENABLED and (
                 frame_index % DETECTION_FRAME_INTERVAL == 0
-            )
+            ) and not ollama_inference_active.is_set()
 
             if run_detection_this_frame:
                 try:
@@ -780,6 +977,7 @@ def main():
                 stop_servos(ser)
                 detach_at = None
     finally:
+        chat_stop.set()
         watchdog_stop.set()
         if hand_detector is not None:
             hand_detector.close()

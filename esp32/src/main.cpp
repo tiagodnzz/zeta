@@ -26,10 +26,15 @@ constexpr uint16_t kEyeColor = TFT_CYAN;
 constexpr uint16_t kBackgroundColor = TFT_BLACK;
 constexpr uint16_t kMouthColor = TFT_CYAN;
 constexpr unsigned long kIdleDelayMs = 1800;
-constexpr unsigned long kIdleCycleMs = 20500;
+constexpr unsigned long kIdleCycleMs = 24000;
 constexpr uint16_t kMenuAccentColor = TFT_YELLOW;
 constexpr uint8_t kMenuItemCount = 6;
 const char* const kMenuLabels[kMenuItemCount] = {"SEGUIR MAO", "SEGUIR ROSTO", "CONTAR DEDOS", "OBJETOS", "DATA E HORA", "DESENHAR"};
+constexpr int16_t kMainEyeRadius = 8;
+constexpr int16_t kMainEyeGap = 64;
+constexpr int16_t kMainMouthWidth = 32;
+constexpr int16_t kMainMouthYOffset = 36;
+constexpr int16_t kMainMouthHeight = 4;
 
 Servo g_servoX;
 Servo g_servoY;
@@ -58,27 +63,84 @@ String g_statusText = "Pronto";
 String g_dialogVisibleText;
 unsigned long g_dialogStartedAt = 0;
 unsigned long g_lastDialogFaceFrame = 0;
+unsigned long g_lastDialogScrollAt = 0;
+unsigned long g_dialogFinishedAt = 0;
+uint16_t g_dialogScrollOffset = 0;
+bool g_dialogSpeaking = false;
+bool g_dialogThinking = false;
 
-constexpr int16_t kDialogBubbleX = 18;
-constexpr int16_t kDialogBubbleY = 30;
+constexpr int16_t kDialogBubbleY = 170;
 constexpr int16_t kDialogBubbleWidth = 250;
-constexpr int16_t kDialogBubbleHeight = 105;
+constexpr int16_t kDialogBubbleHeight = 58;
+constexpr uint8_t kDialogTextSize = 2;
+constexpr uint8_t kDialogVisibleChars = 21;
+constexpr unsigned long kDialogTypeIntervalMs = 85;
+constexpr unsigned long kDialogScrollIntervalMs = 180;
+constexpr unsigned long kDialogHoldAfterSpeechMs = 3500;
+
+int16_t dialogBubbleX() {
+  return (g_tft.width() - kDialogBubbleWidth) / 2;
+}
 
 void drawDialogBubbleFrame(bool clearArea) {
-  const int16_t faceCenterX = 48;
-  const int16_t bubbleBottom = kDialogBubbleY + kDialogBubbleHeight;
+  const int16_t faceCenterX = g_tft.width() / 2;
+  const int16_t bubbleTop = kDialogBubbleY;
+  const int16_t bubbleX = dialogBubbleX();
   if (clearArea) {
-    g_tft.fillRect(8, 22, g_tft.width() - 16, 125, kBackgroundColor);
+    g_tft.fillRect(bubbleX - 4, kDialogBubbleY - 22,
+                   kDialogBubbleWidth + 8, kDialogBubbleHeight + 26,
+                   kBackgroundColor);
   }
-  g_tft.drawRoundRect(kDialogBubbleX, kDialogBubbleY,
+  g_tft.drawRoundRect(bubbleX, kDialogBubbleY,
                       kDialogBubbleWidth, kDialogBubbleHeight, 10, kEyeColor);
-  g_tft.fillTriangle(faceCenterX - 8, bubbleBottom - 1,
-                     faceCenterX + 8, bubbleBottom - 1,
-                     faceCenterX, bubbleBottom + 20, kBackgroundColor);
-  g_tft.drawTriangle(faceCenterX - 8, bubbleBottom - 1,
-                     faceCenterX + 8, bubbleBottom - 1,
-                     faceCenterX, bubbleBottom + 20, kEyeColor);
+  g_tft.fillTriangle(faceCenterX - 8, bubbleTop + 1,
+                     faceCenterX + 8, bubbleTop + 1,
+                     faceCenterX, bubbleTop - 18, kBackgroundColor);
+  g_tft.drawTriangle(faceCenterX - 8, bubbleTop + 1,
+                     faceCenterX + 8, bubbleTop + 1,
+                     faceCenterX, bubbleTop - 18, kEyeColor);
 }
+
+void drawEyeShape(int16_t centerX, int16_t centerY, uint16_t color, bool blinking) {
+  if (blinking) {
+    const int16_t radius = g_eyeWidth / 2;
+    g_tft.fillCircle(centerX, centerY, radius, color);
+    g_tft.fillRect(centerX - radius, centerY - radius, radius * 2 + 1, radius + 1,
+                   kBackgroundColor);
+    return;
+  }
+  g_tft.fillCircle(centerX, centerY, g_eyeWidth / 2, color);
+}
+
+void drawDialogFace(bool blinking, int16_t speakingMouthWidth = 0,
+                    int16_t speakingMouthHeight = kMainMouthHeight) {
+  const int16_t eyeCenterY = g_eyeCenterY - 8;
+  drawEyeShape(g_leftEyeCenterX, eyeCenterY, kEyeColor, blinking);
+  drawEyeShape(g_rightEyeCenterX, eyeCenterY, kEyeColor, blinking);
+  const int16_t mouthY = eyeCenterY + kMainMouthYOffset;
+  if (speakingMouthWidth > 0) {
+    g_tft.drawRoundRect(
+        g_tft.width() / 2 - speakingMouthWidth,
+        mouthY - speakingMouthHeight / 2,
+        speakingMouthWidth * 2, speakingMouthHeight,
+        speakingMouthHeight / 2, kMouthColor);
+  } else {
+    g_tft.fillRoundRect(g_tft.width() / 2 - kMainMouthWidth, mouthY,
+                        kMainMouthWidth * 2, kMainMouthHeight, 2, kMouthColor);
+  }
+}
+
+          void drawDialogText() {
+            g_tft.setTextDatum(TL_DATUM);
+            g_tft.setTextColor(kMenuAccentColor, kBackgroundColor);
+            g_tft.setTextSize(kDialogTextSize);
+            const int end = min(
+              static_cast<int>(g_dialogVisibleText.length()),
+              static_cast<int>(g_dialogScrollOffset) + kDialogVisibleChars);
+            g_tft.drawString(
+              g_dialogVisibleText.substring(g_dialogScrollOffset, end),
+                      dialogBubbleX() + 10, kDialogBubbleY + 20);
+          }
 
 void attachIfNeeded() {
   if (!g_servoX.attached()) {
@@ -89,33 +151,46 @@ void attachIfNeeded() {
   }
 }
 
-void drawEyeShape(int16_t centerX, int16_t centerY, uint16_t color, bool blinking) {
-  const int16_t height = blinking ? 5 : g_eyeHeight;
-  const int16_t cornerRadius = height / 2 < g_eyeCornerRadius ? height / 2 : g_eyeCornerRadius;
-  g_tft.fillRoundRect(centerX - g_eyeWidth / 2, centerY - height / 2,
-                       g_eyeWidth, height, cornerRadius, color);
+void drawSleepingEye(int16_t centerX, int16_t centerY) {
+  constexpr int16_t sleepingEyeWidth = 32;
+  constexpr int16_t sleepingEyeHeight = 8;
+  const int16_t left = centerX - sleepingEyeWidth / 2;
+  const int16_t top = centerY - sleepingEyeHeight / 2;
+  g_tft.fillRoundRect(left, top, sleepingEyeWidth, sleepingEyeHeight, 3,
+                      kEyeColor);
 }
 
 void drawMouth() {
   const int16_t mouthCenterX = g_tft.width() / 2;
-  const int16_t mouthY = g_eyeCenterY + g_eyeHeight / 2 + 28;
-  const int16_t mouthWidth = 16;
-  g_tft.fillRoundRect(mouthCenterX - mouthWidth, mouthY, mouthWidth * 2, 5, 2, kMouthColor);
+  const int16_t mouthY = g_eyeCenterY + kMainMouthYOffset;
+  g_tft.fillRoundRect(mouthCenterX - kMainMouthWidth, mouthY,
+                      kMainMouthWidth * 2, kMainMouthHeight, 2, kMouthColor);
 }
 
 // Rosto ampliado usado como avatar na tela de dialogo.
 void drawMiniFace(int16_t centerX, int16_t centerY, bool blinking = false,
-                  bool smiling = false) {
-  const int16_t eyeWidth = 19;
-  const int16_t eyeHeight = blinking ? 3 : (smiling ? 27 : 30);
-  const int16_t cornerRadius = eyeWidth / 2;
+                  bool smiling = false, int16_t speakingMouthWidth = 0) {
+  const int16_t eyeRadius = 15;
   const int16_t eyeGap = 23;
-  g_tft.fillRoundRect(centerX - eyeGap - eyeWidth / 2, centerY - eyeHeight / 2,
-                       eyeWidth, eyeHeight, cornerRadius, kEyeColor);
-  g_tft.fillRoundRect(centerX + eyeGap - eyeWidth / 2, centerY - eyeHeight / 2,
-                       eyeWidth, eyeHeight, cornerRadius, kEyeColor);
-  const int16_t mouthY = centerY + 25;
-  for (int16_t x = -13; x <= 13; x += 2) {
+  if (blinking) {
+    g_tft.fillCircle(centerX - eyeGap, centerY, eyeRadius, kEyeColor);
+    g_tft.fillCircle(centerX + eyeGap, centerY, eyeRadius, kEyeColor);
+    g_tft.fillRect(centerX - eyeGap - eyeRadius, centerY - eyeRadius,
+                   eyeRadius * 2 + 1, eyeRadius + 1, kBackgroundColor);
+    g_tft.fillRect(centerX + eyeGap - eyeRadius, centerY - eyeRadius,
+                   eyeRadius * 2 + 1, eyeRadius + 1, kBackgroundColor);
+  } else {
+    g_tft.fillCircle(centerX - eyeGap, centerY, eyeRadius, kEyeColor);
+    g_tft.fillCircle(centerX + eyeGap, centerY, eyeRadius, kEyeColor);
+  }
+  if (speakingMouthWidth > 0) {
+    const int16_t mouthY = centerY + 8;
+    g_tft.drawRoundRect(centerX - speakingMouthWidth, mouthY - 2,
+                        speakingMouthWidth * 2, 5, 2, kMouthColor);
+    return;
+  }
+  const int16_t mouthY = centerY + 8;
+  for (int16_t x = -22; x <= 22; x += 2) {
     const int16_t y = mouthY - (x * x) / (smiling ? 42 : 62);
     g_tft.drawPixel(centerX + x, y, kMouthColor);
   }
@@ -192,37 +267,14 @@ void drawFace(bool blinking) {
 
 void drawModeScreen() {
   g_tft.fillScreen(kBackgroundColor);
-  const int16_t screenWidth = g_tft.width();
-  const int16_t screenHeight = g_tft.height();
 
-  g_tft.setTextDatum(MC_DATUM);
-  g_tft.setTextColor(kEyeColor, kBackgroundColor);
-  g_tft.setTextSize(1);
-  g_tft.drawString(kMenuLabels[g_menuIndex], screenWidth / 2, 14);
-
-  // O rosto pequeno fica no canto fisico inferior esquerdo. No sistema de
-  // coordenadas do painel (rotacao 3) esse canto corresponde a X alto.
-  const int16_t faceCenterX = 48;
-  const int16_t faceCenterY = screenHeight - 46;
-
-  const int16_t bubbleX = kDialogBubbleX;
-  const int16_t bubbleY = kDialogBubbleY;
   drawDialogBubbleFrame(false);
 
-  g_tft.setTextDatum(TL_DATUM);
-  g_tft.setTextSize(g_statusText.length() <= 5 ? 4 : 2);
-  g_tft.setTextColor(kMenuAccentColor, kBackgroundColor);
-  const int16_t textX = bubbleX + 10;
-  const int16_t textY = bubbleY + 14;
-  const uint8_t charsPerLine = g_statusText.length() <= 5 ? 5 : (kDialogBubbleWidth - 20) / 12;
-  String text = g_dialogVisibleText;
-  for (uint8_t line = 0; line * charsPerLine < text.length() && line < 4; line++) {
-    const int16_t start = line * charsPerLine;
-    g_tft.drawString(text.substring(start, min((int)(start + charsPerLine), (int)text.length())),
-             textX, textY + line * (g_statusText.length() <= 5 ? 38 : 24));
-  }
+  drawDialogText();
 
-  drawMiniFace(faceCenterX, faceCenterY);
+  const bool animateSpeech = g_dialogSpeaking && !g_dialogThinking;
+  drawDialogFace(false, animateSpeech ? 7 : 0,
+                 animateSpeech ? 6 : kMainMouthHeight);
   g_tft.setTextDatum(TL_DATUM);
 }
 
@@ -230,34 +282,63 @@ void animateDialog() {
   const unsigned long now = millis();
   if (now - g_lastDialogFaceFrame >= 80) {
     g_lastDialogFaceFrame = now;
-    const int16_t faceCenterX = 48;
-    const int16_t baseFaceY = g_tft.height() - 46;
-    const int16_t bobPhase = (now / 160) % 20;
-    const int16_t bobOffset = bobPhase <= 10 ? bobPhase - 5 : 15 - bobPhase;
     const bool blinking = (now % 4200) >= 3600 && (now % 4200) < 3740;
-    const bool smiling = (now / 1800) % 3 != 0;
-    g_tft.fillRect(10, baseFaceY - 26, 76, 70, kBackgroundColor);
-    drawMiniFace(faceCenterX, baseFaceY + bobOffset, blinking, smiling);
+    const bool animateSpeech = g_dialogSpeaking && !g_dialogThinking;
+    const int16_t speakingMouthWidth = animateSpeech
+      ? 5 + ((now / 130) % 4) * 4
+      : 0;
+    const int16_t speakingMouthHeight = animateSpeech
+      ? 4 + ((now / 170) % 4) * 2
+      : kMainMouthHeight;
+    g_tft.fillRect(4, 65, g_tft.width() - 8, 78, kBackgroundColor);
+    drawDialogFace(blinking, speakingMouthWidth, speakingMouthHeight);
   }
 
-  if (g_dialogVisibleText.length() >= g_statusText.length()) return;
-  if (now - g_dialogStartedAt < 55 * g_dialogVisibleText.length()) return;
-  g_dialogVisibleText = g_statusText.substring(0, g_dialogVisibleText.length() + 1);
-  const int16_t bubbleX = kDialogBubbleX;
-  const int16_t bubbleY = kDialogBubbleY;
-  const int16_t bubbleWidth = kDialogBubbleWidth;
-  const int16_t textX = bubbleX + 10;
-  const int16_t textY = bubbleY + 14;
-  const uint8_t charsPerLine = g_statusText.length() <= 5 ? 5 : (bubbleWidth - 20) / 12;
-  drawDialogBubbleFrame(true);
-  g_tft.setTextDatum(TL_DATUM);
-  g_tft.setTextColor(kMenuAccentColor, kBackgroundColor);
-  g_tft.setTextSize(g_statusText.length() <= 5 ? 4 : 2);
-  for (uint8_t line = 0; line * charsPerLine < g_dialogVisibleText.length() && line < 4; line++) {
-    const int16_t start = line * charsPerLine;
-    g_tft.drawString(
-        g_dialogVisibleText.substring(start, min((int)(start + charsPerLine), (int)g_dialogVisibleText.length())),
-        textX, textY + line * (g_statusText.length() <= 5 ? 38 : 24));
+  if (g_dialogVisibleText.length() < g_statusText.length()) {
+    if (now - g_dialogStartedAt < kDialogTypeIntervalMs * g_dialogVisibleText.length()) {
+      g_dialogSpeaking = true;
+      return;
+    }
+    g_dialogVisibleText = g_statusText.substring(0, g_dialogVisibleText.length() + 1);
+    g_dialogSpeaking = true;
+    g_dialogFinishedAt = 0;
+    drawDialogBubbleFrame(true);
+    drawDialogText();
+    return;
+  }
+
+  if (g_dialogThinking) {
+    g_dialogSpeaking = false;
+    g_dialogFinishedAt = 0;
+    return;
+  }
+
+  const uint16_t lastScrollOffset = g_statusText.length() > kDialogVisibleChars
+      ? g_statusText.length() - kDialogVisibleChars
+      : 0;
+  if (g_dialogScrollOffset < lastScrollOffset) {
+    if (now - g_lastDialogScrollAt < kDialogScrollIntervalMs) {
+      g_dialogSpeaking = true;
+      return;
+    }
+    g_dialogSpeaking = true;
+    g_lastDialogScrollAt = now;
+    g_dialogScrollOffset++;
+    g_dialogFinishedAt = 0;
+    drawDialogBubbleFrame(true);
+    drawDialogText();
+    return;
+  }
+
+  g_dialogSpeaking = false;
+  g_dialogThinking = false;
+  if (g_dialogFinishedAt == 0) {
+    g_dialogFinishedAt = now;
+  } else if (now - g_dialogFinishedAt >= kDialogHoldAfterSpeechMs) {
+    g_modeScreenVisible = false;
+    g_dialogVisibleText = "";
+    g_dialogScrollOffset = 0;
+    drawFace(g_lastBlinking);
   }
 }
 
@@ -304,16 +385,17 @@ void drawIdleFace(int16_t eyeOffsetX, bool blinking, bool yawning, bool smiling 
   drawEyeShape(g_rightEyeCenterX + eyeOffsetX, g_eyeCenterY, kEyeColor, blinking);
 
   const int16_t mouthCenterX = g_tft.width() / 2;
-  const int16_t mouthY = g_eyeCenterY + g_eyeHeight / 2 + 28;
+  const int16_t mouthY = g_eyeCenterY + kMainMouthYOffset;
   if (yawning) {
-    g_tft.fillEllipse(mouthCenterX, mouthY + 3, 10, 13, kMouthColor);
+    g_tft.fillEllipse(mouthCenterX, mouthY + 3, 13, 16, kMouthColor);
   } else if (smiling) {
-    for (int16_t x = -16; x < 17; x += 3) {
-      const int16_t y = mouthY - (x * x) / 40;
+    for (int16_t x = -kMainMouthWidth; x <= kMainMouthWidth; x += 3) {
+      const int16_t y = mouthY - (x * x) / 100;
       g_tft.fillCircle(mouthCenterX + x, y, 2, kMouthColor);
     }
   } else {
-    g_tft.fillRoundRect(mouthCenterX - 16, mouthY, 32, 5, 2, kMouthColor);
+    g_tft.fillRoundRect(mouthCenterX - kMainMouthWidth, mouthY,
+                        kMainMouthWidth * 2, kMainMouthHeight, 2, kMouthColor);
   }
 }
 
@@ -321,27 +403,24 @@ void drawSleepZ(unsigned long now);
 
 void drawSleepingFace(unsigned long now) {
   g_tft.fillScreen(kBackgroundColor);
-  drawEyeShape(g_leftEyeCenterX, g_eyeCenterY, kEyeColor, true);
-  drawEyeShape(g_rightEyeCenterX, g_eyeCenterY, kEyeColor, true);
+  drawSleepingEye(g_leftEyeCenterX, g_eyeCenterY);
+  drawSleepingEye(g_rightEyeCenterX, g_eyeCenterY);
 
   drawSleepZ(now);
 }
 
 void drawSleepZ(unsigned long now) {
   const int16_t zAreaLeft = g_leftEyeCenterX - 18;
-  const int16_t zAreaTop = g_eyeCenterY - g_eyeHeight / 2 - 48;
-  g_tft.fillRect(zAreaLeft - 6, zAreaTop - 4, 72, 56, kBackgroundColor);
+  const int16_t zAreaTop = g_eyeCenterY - g_eyeHeight / 2 - 68;
+  g_tft.fillRect(zAreaLeft - 6, zAreaTop - 4, 84, 56, kBackgroundColor);
   g_tft.setTextColor(kEyeColor, kBackgroundColor);
   g_tft.setTextSize(2);
   const int8_t zStep = (now / 180) % 18;
-  const int8_t visibleZ = (now / 600) % 4;
   for (int8_t index = 0; index < 3; index++) {
-    if (visibleZ == index) {
-      const int16_t x = zAreaLeft + index * 20;
-      const int16_t y = zAreaTop + 34 - zStep - index * 8;
-      g_tft.setCursor(x, y < 2 ? 2 : y);
-      g_tft.print("Z");
-    }
+    const int16_t x = zAreaLeft + index * 22;
+    const int16_t y = zAreaTop + 28 - ((zStep + index * 6) % 18) - index * 7;
+    g_tft.setCursor(x, y < 2 ? 2 : y);
+    g_tft.print("Z");
   }
 }
 
@@ -367,12 +446,12 @@ void drawEyeBase() {
   const int16_t halfWidth = screenWidth / 2;
 
   g_eyeCenterY = screenHeight / 2 - 15;
-  g_leftEyeCenterX = halfWidth / 2;
-  g_rightEyeCenterX = halfWidth + halfWidth / 2;
-  g_eyeWidth = halfWidth * 0.45f;
-  g_eyeHeight = g_eyeWidth * 1.6f;
+  g_leftEyeCenterX = halfWidth - kMainEyeGap;
+  g_rightEyeCenterX = halfWidth + kMainEyeGap;
+  g_eyeWidth = kMainEyeRadius * 2;
+  g_eyeHeight = kMainEyeRadius * 2;
   g_eyeCornerRadius = g_eyeWidth / 2;
-  g_maxOffset = min(halfWidth - g_eyeWidth, screenHeight - g_eyeHeight) / 2 - 6;
+  g_maxOffset = 12;
 
   drawFace(false);
 }
@@ -411,24 +490,30 @@ void animateFace() {
 
   const unsigned long idlePosition = (now - g_lastTrackingCommand) % kIdleCycleMs;
   int8_t phase = 0;
-  if (idlePosition >= 2500 && idlePosition < 5500) {
+  if (idlePosition >= 2200 && idlePosition < 4600) {
     phase = 1;
-  } else if (idlePosition >= 5500 && idlePosition < 5900) {
+  } else if (idlePosition >= 4600 && idlePosition < 5200) {
     phase = 2;
-  } else if (idlePosition >= 5900 && idlePosition < 7500) {
+  } else if (idlePosition >= 5200 && idlePosition < 5600) {
     phase = 3;
-  } else if (idlePosition >= 7500 && idlePosition < 10000) {
+  } else if (idlePosition >= 5600 && idlePosition < 8000) {
     phase = 4;
-  } else if (idlePosition >= 10000 && idlePosition < 11000) {
+  } else if (idlePosition >= 8000 && idlePosition < 8600) {
     phase = 5;
-  } else if (idlePosition >= 11000 && idlePosition < 19500) {
+  } else if (idlePosition >= 8600 && idlePosition < 10100) {
     phase = 6;
-  } else if (idlePosition >= 19500) {
+  } else if (idlePosition >= 10100 && idlePosition < 11000) {
     phase = 7;
+  } else if (idlePosition >= 11000 && idlePosition < 12000) {
+    phase = 8;
+  } else if (idlePosition >= 12000 && idlePosition < 21000) {
+    phase = 9;
+  } else {
+    phase = 10;
   }
 
   if (phase == g_idlePhase) {
-    if (phase == 6 && now - g_lastZFrame >= 180) {
+    if (phase == 9 && now - g_lastZFrame >= 180) {
       g_lastZFrame = now;
       drawSleepZ(now);
     }
@@ -440,17 +525,25 @@ void animateFace() {
     g_currentOffsetX = g_maxOffset * 0.7f;
     drawIdleFace(g_currentOffsetX, false, false);
   } else if (phase == 2) {
-    drawIdleFace(g_currentOffsetX, true, false);
+    g_currentOffsetX = 0;
+    drawIdleFace(0, false, false);
   } else if (phase == 3) {
-    g_currentOffsetX = g_maxOffset * 0.35f;
-    drawIdleFace(g_currentOffsetX, false, false);
+    drawIdleFace(0, true, false);
   } else if (phase == 4) {
-    drawIdleFace(g_currentOffsetX, false, true);
+    g_currentOffsetX = -g_maxOffset * 0.7f;
+    drawIdleFace(g_currentOffsetX, false, false);
   } else if (phase == 5) {
-    drawSleepingFace(now);
+    g_currentOffsetX = 0;
+    drawIdleFace(0, false, false);
   } else if (phase == 6) {
-    drawSleepingFace(now);
+    drawIdleFace(0, false, true);
   } else if (phase == 7) {
+    drawIdleFace(0, false, false, true);
+  } else if (phase == 8) {
+    drawSleepingFace(now);
+  } else if (phase == 9) {
+    drawSleepingFace(now);
+  } else if (phase == 10) {
     g_currentOffsetX = 0;
     drawIdleFace(0, false, false, true);
   } else {
@@ -498,8 +591,14 @@ void processCommand(String line) {
     g_statusText = newStatusText;
     g_dialogVisibleText = "";
     g_dialogStartedAt = millis();
-    if (g_modeScreenVisible && !g_menuVisible) {
-      g_tft.fillRect(30, 44, g_tft.width() - 60, 86, kBackgroundColor);
+    g_dialogScrollOffset = 0;
+    g_lastDialogScrollAt = 0;
+    g_dialogFinishedAt = 0;
+    g_dialogSpeaking = true;
+    g_dialogThinking = newStatusText == "Pensando...";
+    if (!g_menuVisible) {
+      g_modeScreenVisible = true;
+      drawModeScreen();
     }
     return;
   }
@@ -507,8 +606,14 @@ void processCommand(String line) {
     g_statusText = "Dedos: " + line.substring(15);
     g_dialogVisibleText = "";
     g_dialogStartedAt = millis();
-    if (g_modeScreenVisible) {
-      g_tft.fillRect(30, 44, g_tft.width() - 60, 86, kBackgroundColor);
+    g_dialogScrollOffset = 0;
+    g_lastDialogScrollAt = 0;
+    g_dialogFinishedAt = 0;
+    g_dialogSpeaking = true;
+    g_dialogThinking = false;
+    if (!g_menuVisible) {
+      g_modeScreenVisible = true;
+      drawModeScreen();
     }
     return;
   }
