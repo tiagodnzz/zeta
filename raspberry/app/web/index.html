@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101b1d">
+  <title>Zeta Control</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main class="shell">
+    <section class="hero panel" data-view="home">
+      <div class="face" aria-label="Carinha animada do Zeta"><canvas id="face-canvas" width="240" height="280"></canvas></div>
+      <div class="hero-copy"><div class="robot-status"><span class="eyebrow">ZETA</span><span id="connection" class="connection">conectando</span></div><h2>Pronto para ver, pensar e mover.</h2><p id="hero-message">O Zeta está online.</p><span id="hero-mode" class="mode-pill">FOLLOW_FACE</span></div>
+    </section>
+
+    <nav class="nav-tabs" aria-label="Áreas do portal">
+      <button class="nav-tab active" data-view-target="home"><span>◉</span> Início</button>
+      <button class="nav-tab" data-view-target="vision"><span>◌</span> Visão</button>
+      <button class="nav-tab" data-view-target="computer"><span>▣</span> Computador</button>
+      <button class="nav-tab" data-view-target="robot"><span>✦</span> Robô</button>
+      <button class="nav-tab" data-view-target="system"><span>⌁</span> Sistema</button>
+    </nav>
+
+    <section class="view active" data-view="home">
+      <div class="section-heading"><div><span class="eyebrow">RESUMO</span><h2>Estado do Zeta</h2></div><span class="live-dot">AO VIVO</span></div>
+      <div class="quick-grid">
+        <article class="metric-card"><span>CPU</span><strong id="quick-cpu">--</strong><small>carga do Raspberry</small></article>
+        <article class="metric-card"><span>MEMÓRIA</span><strong id="quick-memory">--</strong><small>uso atual</small></article>
+        <article class="metric-card"><span>TEMPERATURA</span><strong id="quick-temp">--</strong><small>processador</small></article>
+      </div>
+      <section class="chat-panel panel"><div class="section-heading"><div><span class="eyebrow">CONVERSA</span><h2>Fale com o Zeta</h2></div></div><div id="messages" class="messages" aria-live="polite"><p class="message incoming">Estou ouvindo.</p></div><form id="chat-form"><input id="chat-input" autocomplete="off" placeholder="Escreva uma mensagem..."><button type="submit" class="icon-button" aria-label="Enviar">➤</button></form></section>
+    </section>
+
+    <section class="view" data-view="vision">
+      <div class="section-heading"><div><span class="eyebrow">CÂMERA</span><h2>Visão do Zeta</h2></div><button class="fullscreen-button" data-fullscreen="vision-stage" aria-label="Abrir visão em tela cheia">⛶</button></div>
+      <div id="vision-stage" class="media-stage panel"><img id="camera" src="/stream.mjpg" alt="Visão processada da câmera"><span class="media-badge">PROCESSADO</span><div class="servo-stick" id="servo-stick" aria-label="Controle analógico dos servos"><span class="servo-crosshair"></span><i id="servo-knob"></i></div></div>
+      <div class="vision-info panel"><span id="mode">FOLLOW_FACE</span><strong id="last-message">Pronto</strong><p id="telemetry">Gesto: none · Dedos: 0</p></div>
+    </section>
+
+    <section class="view" data-view="computer">
+      <div class="section-heading"><div><span class="eyebrow">DESKTOP REMOTO</span><h2>Computador do Raspberry</h2></div><button class="fullscreen-button" data-fullscreen="desktop-stage" aria-label="Abrir computador em tela cheia">⛶</button></div>
+      <div id="desktop-stage" class="media-stage desktop-stage panel"><img id="desktop" src="/desktop.mjpg" alt="Tela completa do Raspberry"><span class="media-badge">WAYLAND</span></div>
+      <details class="notebook panel" open><summary><span>⌘</span> Usar como notebook</summary><div class="notebook-body"><div id="mouse-pad" class="mouse-pad">toque e arraste para mover</div><div class="mouse-buttons"><button type="button" data-mouse="left">◉ esquerdo</button><button type="button" data-mouse="right">◉ direito</button><button type="button" data-mouse="double">◎ duplo</button><button type="button" id="drag-toggle">⇱ segurar</button></div><div class="keyboard" id="keyboard"><div class="key-row"><button data-key="ESC">Esc</button><button data-key="TAB">Tab</button><button data-key="CTRL">Ctrl</button><button data-key="ALT">Alt</button><button data-key="BACKSPACE">Back</button></div><div class="key-row"><button data-key="Q">Q</button><button data-key="W">W</button><button data-key="E">E</button><button data-key="R">R</button><button data-key="T">T</button><button data-key="Y">Y</button><button data-key="U">U</button><button data-key="I">I</button><button data-key="O">O</button><button data-key="P">P</button></div><div class="key-row"><button data-key="A">A</button><button data-key="S">S</button><button data-key="D">D</button><button data-key="F">F</button><button data-key="G">G</button><button data-key="H">H</button><button data-key="J">J</button><button data-key="K">K</button><button data-key="L">L</button><button data-key="ENTER">Enter</button></div><div class="key-row"><button data-key="SHIFT">Shift</button><button data-key="Z">Z</button><button data-key="X">X</button><button data-key="C">C</button><button data-key="V">V</button><button data-key="B">B</button><button data-key="N">N</button><button data-key="M">M</button><button data-key="SPACE" class="space-key">Espaço</button></div><div class="key-row arrows"><button data-key="LEFT">←</button><button data-key="UP">↑</button><button data-key="DOWN">↓</button><button data-key="RIGHT">→</button></div></div></div></details>
+    </section>
+
+    <section class="view" data-view="robot">
+      <div class="section-heading"><div><span class="eyebrow">CONTROLE</span><h2>Comportamento do robô</h2></div></div>
+      <div class="mode-grid"><button data-mode="FOLLOW_FACE"><b>◉</b><span>Seguir rosto</span></button><button data-mode="FOLLOW_HAND"><b>✋</b><span>Seguir mão</span></button><button data-mode="COUNT_FINGERS"><b>☝</b><span>Contar dedos</span></button><button data-mode="OBJECT_DETECTION"><b>◇</b><span>Objetos</span></button><button data-mode="DATE_TIME"><b>◷</b><span>Data e hora</span></button><button data-mode="DRAWING"><b>✎</b><span>Desenhar</span></button></div>
+      <button id="stop" class="stop" type="button">■ &nbsp; Parar servos</button>
+    </section>
+
+    <section class="view" data-view="system">
+      <div class="section-heading"><div><span class="eyebrow">OBSERVABILIDADE</span><h2>Desempenho</h2></div><span class="live-dot">ATUALIZAÇÃO CONTÍNUA</span></div>
+      <div class="performance panel"><div class="perf-row"><div><span>CPU</span><strong id="perf-cpu">--</strong></div><div class="meter"><i id="meter-cpu"></i></div></div><div class="perf-row"><div><span>MEMÓRIA</span><strong id="perf-memory">--</strong></div><div class="meter"><i id="meter-memory"></i></div></div><div class="perf-row"><div><span>TEMPERATURA</span><strong id="perf-temp">--</strong></div><div class="temperature-line"><i id="meter-temp"></i></div></div><p class="perf-note">As métricas mostram a carga geral do Raspberry durante a visão computacional e o uso do Ollama. O estado do chat indica quando o LLM está processando.</p></div>
+      <details class="terminal panel"><summary><span>›_</span> Terminal de diagnóstico</summary><div class="terminal-output" id="terminal-output">Comandos permitidos: pwd, ls, ip, uptime, df, free, date</div><form id="terminal-form"><input id="terminal-input" autocomplete="off" placeholder="ex.: uptime"><button type="submit">executar</button></form></details>
+    </section>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>

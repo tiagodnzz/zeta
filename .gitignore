@@ -15,5 +15,5 @@ __pycache__/
 *.pbtxt
 *.rpk
 *MemoryReport.json
-raspberry/yolo11n-pose_imx_model/
+raspberry/models/
 raspberry/yolo11n-pose_rpk/

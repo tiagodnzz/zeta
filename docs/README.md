@@ -14,7 +14,11 @@ Quando não há comandos de rastreamento, o ESP32 executa uma animação de espe
 ```text
 zeta/
 ├── docs/README.md       # esta documentação
-├── raspberry/main.py    # câmera, detecção e envio serial
+├── raspberry/main.py    # entrada compatível para iniciar o robô
+├── raspberry/app/       # aplicação Python, servidor web e controle uinput
+├── raspberry/models/    # modelos de visão e arquivos da câmera
+├── raspberry/tools/     # scripts de teste e diagnóstico
+├── raspberry/docs/      # instruções específicas do Raspberry
 ├── raspberry/requirements.txt # dependências instaladas pelo pip
 └── esp32/
     ├── platformio.ini   # placa, bibliotecas e configuração do TFT
@@ -97,12 +101,24 @@ ls /dev/ttyUSB* /dev/ttyACM*
 
 A porta padrão no código é `/dev/ttyUSB0`. Se o dispositivo usar outro nome, altere `SERIAL_PORT` em `raspberry/main.py`.
 
-O programa baixa automaticamente, na primeira execução, os arquivos necessários quando não os encontra no diretório atual:
+O programa baixa automaticamente, na primeira execução, os arquivos necessários quando não os encontra na pasta `raspberry/models`:
 
-- `haarcascade_frontalface_default.xml`, para detecção do rosto
-- `hand_landmarker.task`, para detecção da mão
+- `models/haarcascade_frontalface_default.xml`, para detecção do rosto
+- `models/hand_landmarker.task`, para detecção da mão
 
 É necessário acesso à internet na primeira execução ou copiar esses arquivos para a pasta `raspberry`.
+
+## Portal do usuário
+
+Com o Zeta em execução, abra `http://IP_DO_RASPBERRY:8080` no telefone conectado à mesma rede. O portal é dividido em cinco áreas:
+
+- **Início**: carinha do Zeta, resumo de CPU, memória, temperatura e chat.
+- **Visão**: vídeo processado da câmera, com botão de tela cheia.
+- **Computador**: captura do desktop Wayland em tela cheia, touchpad, cliques, arraste e teclado virtual.
+- **Robô**: seleção dos modos e parada dos servos.
+- **Sistema**: métricas contínuas do Raspberry e terminal de diagnóstico com comandos restritos.
+
+As métricas são lidas diretamente do sistema Linux e mostram CPU, memória e temperatura enquanto a visão computacional ou o Ollama estão ativos.
 
 ## Executar
 
