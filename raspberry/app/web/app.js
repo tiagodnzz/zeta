@@ -13,6 +13,12 @@ const terminalOutput = document.querySelector('#terminal-output');
 const servoStick = document.querySelector('#servo-stick');
 const servoKnob = document.querySelector('#servo-knob');
 const faceCanvas = document.querySelector('#face-canvas');
+const voiceButton = document.querySelector('#voice-button');
+const voiceTranscript = document.querySelector('#voice-transcript');
+const voiceStatus = document.querySelector('#voice-status');
+const voiceResponse = document.querySelector('#voice-response');
+const monitorMode = new URLSearchParams(location.search).has('monitor');
+if (monitorMode) document.body.classList.add('monitor-mode');
 
 function drawRobotFace(now) {
   const context = faceCanvas.getContext('2d');
@@ -94,6 +100,10 @@ function render(state) {
   lastMessage.textContent = state.last_message;
   heroMessage.textContent = state.chat_busy ? 'Estou pensando...' : state.last_message;
   telemetry.textContent = `Gesto: ${state.gesture} · Dedos: ${state.finger_count}`;
+  if (inputFeedback && state.input_ready === false) {
+    inputFeedback.textContent = 'Mouse e teclado indisponiveis: verifique /dev/uinput no Raspberry.';
+    inputFeedback.classList.add('error');
+  }
   if (state.chat_messages) {
     messages.replaceChildren(...state.chat_messages.map((message) => {
       const item = document.createElement('p');
@@ -102,6 +112,8 @@ function render(state) {
       return item;
     }));
     messages.scrollTop = messages.scrollHeight;
+    const lastResponse = [...state.chat_messages].reverse().find((message) => message.kind === 'incoming');
+    if (lastResponse && voiceResponse) voiceResponse.textContent = lastResponse.text;
   }
   renderMetrics(state.metrics);
 }
@@ -131,15 +143,70 @@ document.querySelectorAll('[data-fullscreen]').forEach((button) => {
 document.querySelectorAll('[data-mode]').forEach((button) => button.addEventListener('click', () => post('/api/mode', {mode: button.dataset.mode})));
 document.querySelector('#stop').addEventListener('click', () => post('/api/stop', {}));
 
+async function sendChat(text) {
+  addMessage(text, 'outgoing');
+  await post('/api/chat', {text});
+}
+
 form.addEventListener('submit', async (event) => {
   event.preventDefault();
   const text = input.value.trim();
   if (!text) return;
-  addMessage(text, 'outgoing');
   input.value = '';
-  await post('/api/chat', {text});
+  await sendChat(text);
 });
 
+if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+  voiceButton.disabled = true;
+  voiceStatus.textContent = 'gravacao de voz nao suportada neste navegador';
+} else {
+  let recorder = null;
+  let microphoneStream = null;
+  let audioChunks = [];
+  voiceButton.addEventListener('click', async () => {
+    if (recorder?.state === 'recording') {
+      recorder.stop();
+      return;
+    }
+    try {
+      microphoneStream = await navigator.mediaDevices.getUserMedia({audio: true});
+      audioChunks = [];
+      recorder = new MediaRecorder(microphoneStream);
+      recorder.addEventListener('dataavailable', (event) => {
+        if (event.data.size) audioChunks.push(event.data);
+      });
+      recorder.addEventListener('start', () => {
+        voiceButton.classList.add('listening');
+        voiceButton.setAttribute('aria-pressed', 'true');
+        voiceStatus.textContent = 'ouvindo... toque novamente para enviar';
+        voiceTranscript.textContent = 'Fale agora...';
+      });
+      recorder.addEventListener('stop', async () => {
+        voiceButton.classList.remove('listening');
+        voiceButton.setAttribute('aria-pressed', 'false');
+        voiceStatus.textContent = 'transcrevendo localmente...';
+        microphoneStream?.getTracks().forEach((track) => track.stop());
+        const blob = new Blob(audioChunks, {type: recorder.mimeType || 'audio/webm'});
+        const body = new FormData();
+        body.append('audio', blob, 'voice.webm');
+        try {
+          const response = await fetch('/api/transcribe', {method: 'POST', body});
+          const result = await response.json();
+          if (!response.ok || result.accepted === false) throw new Error(result.error || 'falha na transcricao');
+          voiceTranscript.textContent = result.text;
+          voiceStatus.textContent = 'transcricao enviada';
+        } catch (error) {
+          voiceStatus.textContent = error.message || 'falha na transcricao';
+        }
+      });
+      recorder.start();
+    } catch (error) {
+      voiceStatus.textContent = error.name === 'NotAllowedError'
+        ? 'permissao do microfone negada neste navegador'
+        : 'nao foi possivel acessar o microfone';
+    }
+  });
+}
 terminalForm.addEventListener('submit', async (event) => {
   event.preventDefault();
   const command = terminalInput.value.trim();
@@ -150,8 +217,6 @@ terminalForm.addEventListener('submit', async (event) => {
   terminalOutput.textContent = `> ${command}\n\n${result.output}`;
 });
 
-async function mouse(action, x, y) { await post('/api/mouse', {action, x, y}); }
-async function key(keyName, pressed = false) { await post('/api/key', {key: keyName, pressed}); }
 async function servo(x, y) { await post('/api/servo', {x, y}); }
 
 let servoPointer = null;
@@ -185,6 +250,14 @@ const mousePad = document.querySelector('#mouse-pad');
 const dragToggle = document.querySelector('#drag-toggle');
 const notebook = document.querySelector('.notebook');
 const desktopStage = document.querySelector('#desktop-stage');
+const inputFeedback = document.querySelector('#input-feedback');
+function showInputResult(result) {
+  if (!inputFeedback || !result || result.accepted !== false) return;
+  inputFeedback.textContent = result.error || 'Entrada virtual indisponivel.';
+  inputFeedback.classList.add('error');
+}
+async function mouse(action, x, y) { showInputResult(await post('/api/mouse', {action, x, y})); }
+async function key(keyName, pressed = false) { showInputResult(await post('/api/key', {key: keyName, pressed})); }
 const notebookAnchor = document.createComment('controles do notebook');
 notebook.parentNode.insertBefore(notebookAnchor, notebook);
 document.addEventListener('fullscreenchange', () => {
@@ -192,6 +265,8 @@ document.addEventListener('fullscreenchange', () => {
   else if (notebook.parentNode !== notebookAnchor.parentNode) notebookAnchor.parentNode.insertBefore(notebook, notebookAnchor.nextSibling);
 });
 let lastPointer = null;
+let pendingMouseMove = null;
+let mouseMoveFrame = null;
 let leftButtonDown = false;
 function releaseLeftButton() {
   if (!leftButtonDown) return;
@@ -215,12 +290,29 @@ mousePad.addEventListener('pointermove', (event) => {
   if (!lastPointer) return;
   const dx = event.clientX - lastPointer.x;
   const dy = event.clientY - lastPointer.y;
-  if (Math.abs(dx) + Math.abs(dy) < 4) return;
   lastPointer = {x: event.clientX, y: event.clientY};
-  mouse('move_relative', dx, dy);
+  if (!dx && !dy) return;
+  pendingMouseMove = {
+    x: (pendingMouseMove?.x || 0) + dx,
+    y: (pendingMouseMove?.y || 0) + dy,
+  };
+  if (mouseMoveFrame !== null) return;
+  mouseMoveFrame = requestAnimationFrame(() => {
+    const movement = pendingMouseMove;
+    pendingMouseMove = null;
+    mouseMoveFrame = null;
+    if (movement && (movement.x || movement.y)) mouse('move_relative', movement.x, movement.y);
+  });
 });
-mousePad.addEventListener('pointerup', (event) => { event.preventDefault(); lastPointer = null; });
-mousePad.addEventListener('pointercancel', () => { lastPointer = null; });
+function stopMousePointer(event) {
+  event.preventDefault();
+  lastPointer = null;
+  pendingMouseMove = null;
+  if (mouseMoveFrame !== null) cancelAnimationFrame(mouseMoveFrame);
+  mouseMoveFrame = null;
+}
+mousePad.addEventListener('pointerup', stopMousePointer);
+mousePad.addEventListener('pointercancel', stopMousePointer);
 
 document.querySelectorAll('[data-key]').forEach((button) => {
   const keyName = button.dataset.key;

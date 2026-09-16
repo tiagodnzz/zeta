@@ -8,3 +8,5 @@ fastapi
 uvicorn
 websockets
 evdev
+faster-whisper
+python-multipart

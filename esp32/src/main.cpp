@@ -28,8 +28,8 @@ constexpr uint16_t kMouthColor = TFT_CYAN;
 constexpr unsigned long kIdleDelayMs = 1800;
 constexpr unsigned long kIdleCycleMs = 24000;
 constexpr uint16_t kMenuAccentColor = TFT_YELLOW;
-constexpr uint8_t kMenuItemCount = 6;
-const char* const kMenuLabels[kMenuItemCount] = {"SEGUIR MAO", "SEGUIR ROSTO", "CONTAR DEDOS", "OBJETOS", "DATA E HORA", "DESENHAR"};
+constexpr uint8_t kMenuItemCount = 9;
+const char* const kMenuLabels[kMenuItemCount] = {"SEGUIR MAO", "SEGUIR ROSTO", "CONTAR DEDOS", "OBJETOS", "DATA E HORA", "DESENHAR", "YOUTUBE", "SPOTIFY", "NAVEGADOR"};
 constexpr int16_t kMainEyeRadius = 8;
 constexpr int16_t kMainEyeGap = 64;
 constexpr int16_t kMainMouthWidth = 32;
@@ -252,6 +252,9 @@ const uint16_t* menuIconForIndex(uint8_t index) {
     case 2: return iconPanToolAlt;
     case 3: return iconFitScreen;
     case 4: return iconSchedule;
+    case 6: return iconYoutube;
+    case 7: return iconSpotify;
+    case 8: return iconChromium;
     default: return nullptr;
   }
 }
@@ -579,6 +582,9 @@ void processCommand(String line) {
     else if (mode == "OBJECT_DETECTION") g_menuIndex = 3;
     else if (mode == "DATE_TIME") g_menuIndex = 4;
     else if (mode == "DRAWING") g_menuIndex = 5;
+    else if (mode == "YOUTUBE") g_menuIndex = 6;
+    else if (mode == "SPOTIFY") g_menuIndex = 7;
+    else if (mode == "BROWSER") g_menuIndex = 8;
     g_statusText = "Ativo";
     drawModeScreen();
     return;

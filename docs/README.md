@@ -120,6 +120,8 @@ Com o Zeta em execução, abra `http://IP_DO_RASPBERRY:8080` no telefone conecta
 
 As métricas são lidas diretamente do sistema Linux e mostram CPU, memória e temperatura enquanto a visão computacional ou o Ollama estão ativos.
 
+Os modos **YouTube + mão**, **Spotify + mão** e **Navegador + mão** abrem o endereço correspondente no Chromium no Raspberry. Ao selecionar novamente o mesmo aplicativo, o Zeta apenas tenta trazer a janela existente para frente. Com um desses modos ativo, a ponta do dedo indicador move o ponteiro do desktop e a aproximação do polegar com o indicador (pinça) faz um clique esquerdo rapidamente; mantenha a pinça por um instante e abra a mão antes do próximo clique. Ao cancelar o menu, deixar o menu expirar ou pressionar `F`, o modo volta para **Seguir rosto** e o Chromium continua aberto. O Chromium precisa estar instalado e o usuário precisa ter acesso a `/dev/uinput`.
+
 ## Executar
 
 ```bash

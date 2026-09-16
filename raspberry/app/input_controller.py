@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+import os
 from dataclasses import dataclass
 
 
@@ -85,6 +86,40 @@ class VirtualInput:
 def create_virtual_input():
     try:
         return VirtualInput()
+    except OSError as error:
+        device = "/dev/uinput"
+        try:
+            device_stat = os.stat(device)
+            permissions = oct(device_stat.st_mode & 0o777)
+            owner = device_stat.st_uid
+            group = device_stat.st_gid
+            details = f"{device} modo {permissions}, uid {owner}, gid {group}"
+        except OSError as stat_error:
+            details = f"nao foi possivel consultar {device}: {stat_error}"
+        print(
+            f"Aviso: nao foi possivel abrir {device} para teclado/mouse virtual ({error}). "
+            f"{details}. Instale docs/99-zeta-uinput.rules e adicione o usuario ao grupo input."
+        )
+        return None
+    except ModuleNotFoundError as error:
+        print(
+            f"Aviso: dependencia ausente ({error}). Instale evdev no ambiente Python do Zeta."
+        )
+        return None
     except Exception as error:
+        if "/dev/uinput" in str(error):
+            try:
+                device_stat = os.stat("/dev/uinput")
+                details = (
+                    f"modo {oct(device_stat.st_mode & 0o777)}, "
+                    f"uid {device_stat.st_uid}, gid {device_stat.st_gid}"
+                )
+            except OSError as stat_error:
+                details = f"nao foi possivel consultar /dev/uinput: {stat_error}"
+            print(
+                f"Aviso: /dev/uinput sem acesso para escrita ({error}); {details}. "
+                "Instale docs/99-zeta-uinput.rules e adicione o usuario ao grupo input."
+            )
+            return None
         print(f"Aviso: controle uinput indisponivel: {error}")
         return None

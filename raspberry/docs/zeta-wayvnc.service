@@ -1,0 +1,13 @@
+[Unit]
+Description=Zeta VNC na sessao Wayland atual
+After=graphical-session.target
+
+[Service]
+WorkingDirectory=%h/.config/zeta-wayvnc
+Environment=WAYLAND_DISPLAY=wayland-0
+ExecStart=/usr/bin/wayvnc --config=%h/.config/zeta-wayvnc/config --render-cursor --address=0.0.0.0
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

@@ -4,11 +4,14 @@ import os
 import subprocess
 import threading
 import time
+import tempfile
+import re
+from urllib.parse import quote_plus
 from glob import glob
 from dataclasses import dataclass
 from pathlib import Path
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from .input_controller import VirtualInput
@@ -16,7 +19,7 @@ from .input_controller import VirtualInput
 
 ROBOT_MODES = (
     "FOLLOW_HAND", "FOLLOW_FACE", "COUNT_FINGERS",
-    "OBJECT_DETECTION", "DATE_TIME", "DRAWING",
+    "OBJECT_DETECTION", "DATE_TIME", "DRAWING", "YOUTUBE", "SPOTIFY", "BROWSER",
 )
 WEB_HOST = os.environ.get("ZETA_WEB_HOST", "0.0.0.0")
 WEB_PORT = int(os.environ.get("ZETA_WEB_PORT", "8080"))
@@ -55,6 +58,77 @@ class KeyRequest(BaseModel):
 class ServoRequest(BaseModel):
     x: float
     y: float
+
+
+WHISPER_MODEL_NAME = os.environ.get("ZETA_WHISPER_MODEL", "tiny")
+WHISPER_DEVICE = os.environ.get("ZETA_WHISPER_DEVICE", "cpu")
+WHISPER_COMPUTE_TYPE = os.environ.get("ZETA_WHISPER_COMPUTE_TYPE", "int8")
+WHISPER_CPU_THREADS = int(os.environ.get("ZETA_WHISPER_CPU_THREADS", str(os.cpu_count() or 1)))
+_whisper_model = None
+_whisper_model_lock = threading.Lock()
+
+
+def youtube_search_query(text):
+    match = re.search(
+        r"\b(?:procure|pesquise|buscar|busque|pesquisar|toque|tocar)\s+(.+?)\s+"
+        r"(?:no|na|em)\s+youtube\b",
+        text,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    query = " ".join(match.group(1).split()).strip(" .,!?:;")
+    return query or None
+
+
+def transcribe_audio(audio, suffix):
+    global _whisper_model
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError as error:
+        raise RuntimeError("faster-whisper nao esta instalado no ambiente do Zeta.") from error
+
+    if _whisper_model is None:
+        with _whisper_model_lock:
+            if _whisper_model is None:
+                _whisper_model = WhisperModel(
+                    WHISPER_MODEL_NAME,
+                    device=WHISPER_DEVICE,
+                    compute_type=WHISPER_COMPUTE_TYPE,
+                    cpu_threads=WHISPER_CPU_THREADS,
+                )
+
+    with tempfile.TemporaryDirectory(prefix="zeta-whisper-") as temp_dir:
+        input_path = Path(temp_dir) / f"input{suffix}"
+        input_path.write_bytes(audio)
+        conversion = subprocess.run(
+            (
+                "ffmpeg", "-nostdin", "-loglevel", "error", "-i", str(input_path),
+                "-f", "s16le", "-ar", "16000", "-ac", "1", "pipe:1",
+            ),
+            capture_output=True,
+            text=False,
+            check=False,
+        )
+        if conversion.returncode != 0:
+            error = conversion.stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"Nao foi possivel decodificar o audio: {error}")
+        try:
+            import numpy as np
+        except ImportError as error:
+            raise RuntimeError("numpy nao esta instalado no ambiente do Zeta.") from error
+        audio_samples = np.frombuffer(conversion.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+        segments, _ = _whisper_model.transcribe(
+            audio_samples,
+            language="pt",
+            beam_size=1,
+            best_of=1,
+            temperature=0,
+            condition_on_previous_text=False,
+            vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": 300},
+        )
+        return " ".join(segment.text.strip() for segment in segments).strip()
 
 
 def read_system_metrics():
@@ -104,6 +178,7 @@ class RobotWebState:
             "chat_messages": [{"text": "Estou ouvindo.", "kind": "incoming"}],
             "frame": None,
             "desktop_frame": None,
+            "input_ready": False,
             "metrics": read_system_metrics(),
         }
 
@@ -231,6 +306,11 @@ def create_app(command_queue, chat_queue, state: RobotWebState, stop_event, virt
         text = " ".join(request.text.split())
         if not text:
             return {"accepted": False, "error": "Mensagem vazia."}
+        youtube_query = youtube_search_query(text)
+        if youtube_query:
+            command_queue.put_nowait(WebCommand("youtube_search", quote_plus(youtube_query)))
+            state.add_chat_message(text, "outgoing")
+            return {"accepted": True, "youtube_search": youtube_query}
         try:
             chat_queue.put_nowait(text)
         except Exception:
@@ -238,6 +318,29 @@ def create_app(command_queue, chat_queue, state: RobotWebState, stop_event, virt
         state.update(chat_busy=True, last_message="Pensando...")
         state.add_chat_message(text, "outgoing")
         return {"accepted": True}
+
+    @app.post("/api/transcribe")
+    async def transcribe(audio: UploadFile = File(...)):
+        content_type = audio.content_type or ""
+        suffix = ".webm" if "webm" in content_type else ".ogg"
+        try:
+            text = await asyncio.to_thread(transcribe_audio, await audio.read(), suffix)
+        except (OSError, RuntimeError, UnicodeError) as error:
+            return {"accepted": False, "error": str(error)}
+        if not text:
+            return {"accepted": False, "error": "Nenhuma fala detectada."}
+        youtube_query = youtube_search_query(text)
+        if youtube_query:
+            command_queue.put_nowait(WebCommand("youtube_search", quote_plus(youtube_query)))
+            state.add_chat_message(text, "outgoing")
+            return {"accepted": True, "text": text, "youtube_search": youtube_query}
+        try:
+            chat_queue.put_nowait(text)
+        except Exception:
+            return {"accepted": False, "error": "Zeta ainda esta respondendo."}
+        state.update(chat_busy=True, last_message="Pensando...")
+        state.add_chat_message(text, "outgoing")
+        return {"accepted": True, "text": text}
 
     @app.post("/api/mode")
     async def mode(request: ModeRequest):
@@ -263,18 +366,18 @@ def create_app(command_queue, chat_queue, state: RobotWebState, stop_event, virt
     @app.post("/api/mouse")
     async def mouse(request: MouseRequest):
         if virtual_input is None:
-            return {"output": "uinput indisponivel ou sem permissao."}
+            return {"accepted": False, "error": "Entrada virtual indisponivel. Verifique evdev e /dev/uinput."}
         result = await asyncio.to_thread(
             virtual_input.mouse, request.action, round(request.x or 0), round(request.y or 0)
         )
-        return {"output": result.message}
+        return {"accepted": result.ok, "output": result.message}
 
     @app.post("/api/key")
     async def key(request: KeyRequest):
         if virtual_input is None:
-            return {"output": "uinput indisponivel ou sem permissao."}
+            return {"accepted": False, "error": "Entrada virtual indisponivel. Verifique evdev e /dev/uinput."}
         result = await asyncio.to_thread(virtual_input.key, request.key, request.pressed)
-        return {"output": result.message}
+        return {"accepted": result.ok, "output": result.message}
 
     @app.websocket("/ws")
     async def websocket(websocket: WebSocket):

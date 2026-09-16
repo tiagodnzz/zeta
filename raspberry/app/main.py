@@ -70,7 +70,7 @@ SERVO_SEND_INTERVAL = 0.05
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434/api/chat")
 OLLAMA_MODEL = os.environ.get(
     "OLLAMA_MODEL", # llama3.2:3b qwen2.5:3b - gemma3:4b - gemma3:1b
-    os.environ.get("OLLAMA_MODAL", "qwen2.5:3b"),
+    os.environ.get("OLLAMA_MODAL", "gemma3:1b"),
 )
 OLLAMA_TIMEOUT_S = float(os.environ.get("OLLAMA_TIMEOUT_S", "180"))
 OLLAMA_START_TIMEOUT_S = float(os.environ.get("OLLAMA_START_TIMEOUT_S", "15"))
@@ -78,6 +78,13 @@ OLLAMA_CONTEXT = (
     "Voce e o Zeta, um robo simpatico. Responda em portugues, de forma breve "
     "e natural, usando no maximo 240 caracteres."
 )
+
+TTS_ENABLED = os.environ.get("ZETA_TTS_ENABLED", "1") != "0"
+TTS_MODEL = os.environ.get(
+    "ZETA_TTS_MODEL", os.path.join(MODELS_DIR, "pt_BR-faber-medium.onnx")
+)
+TTS_VOICE = os.environ.get("ZETA_TTS_VOICE", "pt-br")
+TTS_TARGET = os.environ.get("ZETA_TTS_TARGET", "")
 
 SERVO_LIMIT = 0.8          # mesmo limite normalizado de -1.0 a 1.0
 MANUAL_SERVO_STEP = 0.025
@@ -89,10 +96,96 @@ FACE_TRACK_EASE = 0.15         # fracao do erro corrigida por quadro (movimento 
 FACE_LOST_GRACE_FRAMES = 6     # mantem o ultimo alvo por alguns quadros ao perder o rosto
 ROBOT_MODES = (
     "FOLLOW_HAND", "FOLLOW_FACE", "COUNT_FINGERS", "OBJECT_DETECTION", "DATE_TIME", "DRAWING",
+    "YOUTUBE", "SPOTIFY", "BROWSER",
 )
 DEFAULT_MODE = "FOLLOW_FACE"
+APP_MODES = ("YOUTUBE", "SPOTIFY", "BROWSER")
+APP_URLS = {
+    "YOUTUBE": "https://www.youtube.com",
+    "SPOTIFY": "https://open.spotify.com",
+    "BROWSER": "https://www.google.com",
+}
+APP_BROWSER_COMMANDS = ("chromium", "chromium-browser")
+app_browser_process = None
+app_browser_mode = None
+monitor_browser_process = None
+SCREEN_WIDTH = int(os.environ.get("ZETA_SCREEN_WIDTH", "1920"))
+SCREEN_HEIGHT = int(os.environ.get("ZETA_SCREEN_HEIGHT", "1080"))
+ZETA_BROWSER_WIDTH = int(os.environ.get("ZETA_BROWSER_WIDTH", "1344"))
+ZETA_SIDE_WIDTH = int(os.environ.get("ZETA_SIDE_WIDTH", "576"))
+ZETA_CAMERA_HEIGHT = int(os.environ.get("ZETA_CAMERA_HEIGHT", "500"))
+ZETA_MONITOR_HEIGHT = int(os.environ.get("ZETA_MONITOR_HEIGHT", "500"))
+
+
+def screen_geometry():
+    """Retorna a resolucao configurada para o monitor do Raspberry."""
+    return SCREEN_WIDTH, SCREEN_HEIGHT
+
+
+def window_layout():
+    width, height = screen_geometry()
+    browser_width = ZETA_BROWSER_WIDTH
+    side_width = ZETA_SIDE_WIDTH
+    camera_height = ZETA_CAMERA_HEIGHT
+    monitor_height = ZETA_MONITOR_HEIGHT or max(1, height - camera_height)
+    return {
+        "browser": (0, 0, browser_width, height),
+        "camera": (browser_width, 0, side_width, camera_height),
+        "monitor": (
+            browser_width,
+            camera_height,
+            side_width,
+            monitor_height,
+        ),
+    }
+
+
+def place_window(window_class, geometry, maximize_vertical=False, window_title=None):
+    """Aplica geometria em pixels quando a sessao oferece wmctrl/XWayland."""
+    if shutil.which("wmctrl") is None:
+        return False
+    x, y, width, height = geometry
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        windows = subprocess.run(
+            ("wmctrl", "-lGx"), capture_output=True, text=True, check=False
+        ).stdout.splitlines()
+        matches = [
+            line.split()[0]
+            for line in windows
+            if window_class.lower() in line.lower()
+            or (window_title and window_title.lower() in line.lower())
+        ]
+        if matches:
+            window_id = matches[-1]
+            subprocess.run(
+                ("wmctrl", "-i", "-r", window_id, "-b", "remove,fullscreen,maximized_vert,maximized_horz"),
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+            )
+            result = subprocess.run(
+                ("wmctrl", "-i", "-r", window_id, "-e", f"0,{x},{y},{width},{height}"),
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+            )
+            if result.returncode == 0:
+                if maximize_vertical:
+                    subprocess.run(
+                        ("wmctrl", "-i", "-r", window_id, "-b", "add,maximized_vert"),
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+                    )
+                return True
+        time.sleep(0.1)
+    return False
+
+
+def browser_profile(name):
+    profile_root = os.path.join("/tmp", f"zeta-{name}-chromium")
+    os.makedirs(profile_root, exist_ok=True)
+    return profile_root
 GESTURE_REQUIRED_FRAMES = 6
+PINCH_REQUIRED_FRAMES = 2
 GESTURE_COOLDOWN_S = 0.8
+PINCH_COOLDOWN_S = 0.25
+GESTURE_MOUSE_SENSITIVITY = 900
 MENU_IDLE_TIMEOUT_S = 8.0
 # TFLite/XNNPACK satura todos os nucleos durante a inferencia, o que pode
 # impedir a thread de IPA da camera de rodar a tempo e travar capture_array().
@@ -323,7 +416,82 @@ def ask_ollama(prompt):
         return payload["response"].strip()
 
 
-def ollama_worker(ser, prompt_queue, stop_event, inference_active, web_state=None):
+def speak_text(text):
+    if not TTS_ENABLED or not text:
+        return
+    player = shutil.which("pw-play") or shutil.which("aplay")
+    if player is None:
+        print("Aviso: nenhum reprodutor de audio encontrado (pw-play/aplay).", file=sys.stderr)
+        return
+
+    def play_audio(audio):
+        command = [player]
+        if os.path.basename(player) == "pw-play":
+            if TTS_TARGET:
+                command.extend(("--target", TTS_TARGET))
+            command.append("-")
+        else:
+            if TTS_TARGET:
+                command.extend(("-D", TTS_TARGET))
+            command.extend(("-q", "-"))
+        result = subprocess.run(
+            command, input=audio, check=False,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        )
+        if result.returncode != 0:
+            error = result.stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"reproducao de audio falhou ({result.returncode}): {error}")
+
+    piper = shutil.which("piper")
+    if piper and os.path.exists(TTS_MODEL):
+        try:
+            audio = subprocess.run(
+                (piper, "--model", TTS_MODEL, "--output_file", "-"),
+                input=text.encode("utf-8"),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+            ).stdout
+            play_audio(audio)
+            return
+        except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
+            print(f"Aviso: Piper falhou; tentando espeak-ng: {error}", file=sys.stderr)
+
+    espeak = shutil.which("espeak-ng")
+    if espeak:
+        try:
+            audio = subprocess.run(
+                (espeak, "-v", TTS_VOICE, "--stdout", text),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                check=True,
+            ).stdout
+            play_audio(audio)
+            return
+        except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
+            print(f"Aviso: espeak-ng falhou: {error}", file=sys.stderr)
+
+
+def tts_worker(text_queue, stop_event):
+    warned = False
+    while not stop_event.is_set():
+        try:
+            text = text_queue.get(timeout=0.2)
+        except queue.Empty:
+            continue
+        try:
+            if not shutil.which("piper") and not shutil.which("espeak-ng") and not warned:
+                print(
+                    "Aviso: TTS indisponivel; instale piper ou espeak-ng para ativar a voz.",
+                    file=sys.stderr,
+                )
+                warned = True
+            speak_text(text)
+        finally:
+            text_queue.task_done()
+
+
+def ollama_worker(ser, prompt_queue, stop_event, inference_active, web_state=None, tts_queue=None):
     while not stop_event.is_set():
         try:
             prompt = prompt_queue.get(timeout=0.2)
@@ -340,6 +508,11 @@ def ollama_worker(ser, prompt_queue, stop_event, inference_active, web_state=Non
                 response = "Nao consegui responder agora."
             print(f"Zeta: {response}")
             send_status_text(ser, response)
+            if tts_queue is not None:
+                try:
+                    tts_queue.put_nowait(response)
+                except queue.Full:
+                    pass
             if web_state is not None:
                 web_state.update(chat_busy=False, last_message=response)
                 web_state.add_chat_message(response, "incoming")
@@ -374,6 +547,74 @@ def open_robot_menu(ser):
     send_robot_command(ser, "MODE:MENU")
 
 
+def open_app_in_chromium(mode, url_override=None):
+    global app_browser_process, app_browser_mode
+    url = url_override or APP_URLS.get(mode)
+    if url is None:
+        return False
+    browser = next((command for command in APP_BROWSER_COMMANDS if shutil.which(command)), None)
+    if browser is None:
+        print("Aviso: Chromium nao encontrado; instale chromium no Raspberry.", file=sys.stderr)
+        return False
+    if app_browser_mode == mode and url_override is None:
+        for focus_command in (("wmctrl", "-a", "Chromium"), ("xdotool", "search", "--class", "chromium", "windowactivate", "%@")):
+            if shutil.which(focus_command[0]):
+                subprocess.run(focus_command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                break
+        return True
+    try:
+        x, y, width, height = window_layout()["browser"]
+        app_browser_process = subprocess.Popen(
+            (
+                browser, f"--user-data-dir={browser_profile('desktop')}",
+                "--ozone-platform=x11", "--class=ZetaBrowser", "--new-window",
+                f"--window-position={x},{y}",
+                f"--window-size={width},{height}", url,
+            ),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        place_window("ZetaBrowser", (x, y, width, height), maximize_vertical=True)
+    except OSError as error:
+        print(f"Aviso: nao foi possivel abrir {url}: {error}", file=sys.stderr)
+        return False
+    app_browser_mode = mode
+    return True
+
+
+def open_youtube_search(query):
+    return open_app_in_chromium(
+        "YOUTUBE", f"https://www.youtube.com/results?search_query={query}"
+    )
+
+
+def open_monitor_browser():
+    global monitor_browser_process
+    browser = next((command for command in APP_BROWSER_COMMANDS if shutil.which(command)), None)
+    if browser is None:
+        return False
+    x, y, width, height = window_layout()["monitor"]
+    try:
+        monitor_browser_process = subprocess.Popen(
+            (
+                browser, f"--user-data-dir={browser_profile('monitor')}",
+                "--ozone-platform=x11", "--class=ZetaMonitor",
+                "--app=http://127.0.0.1:8080/?monitor=1",
+                "--no-first-run", "--no-default-browser-check",
+                f"--window-position={x},{y}", f"--window-size={width},{height}",
+            ),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        place_window("ZetaMonitor", (x, y, width, height), window_title="Zeta Control")
+    except OSError as error:
+        print(f"Aviso: nao foi possivel abrir o painel do monitor: {error}", file=sys.stderr)
+        return False
+    return True
+
+
 MODE_INTRO_TEXT = {
     "FOLLOW_HAND": "Seguindo sua mao",
     "FOLLOW_FACE": "Seguindo seu rosto",
@@ -381,6 +622,9 @@ MODE_INTRO_TEXT = {
     "OBJECT_DETECTION": "Procurando objetos",
     "DATE_TIME": "Vendo as horas",
     "DRAWING": "Modo desenho",
+    "YOUTUBE": "Abrindo YouTube",
+    "SPOTIFY": "Abrindo Spotify",
+    "BROWSER": "Abrindo navegador",
 }
 
 
@@ -391,6 +635,8 @@ def select_robot_mode(ser, mode):
     send_robot_command(ser, f"MODE:{display_mode}")
     if mode in MODE_INTRO_TEXT:
         send_status_text(ser, MODE_INTRO_TEXT[mode])
+    if mode in APP_MODES:
+        open_app_in_chromium(mode)
 
 
 # Watchdog de diagnostico: identifica em qual etapa do loop o programa
@@ -590,6 +836,11 @@ def count_extended_fingers(hand_landmarks, handedness=None):
 
 
 def classify_hand_gesture(hand_landmarks):
+    thumb_tip = hand_landmarks[4]
+    index_tip = hand_landmarks[8]
+    pinch_distance = ((thumb_tip.x - index_tip.x) ** 2 + (thumb_tip.y - index_tip.y) ** 2) ** 0.5
+    if pinch_distance < 0.055:
+        return "pinch"
     finger_extended = [
         hand_landmarks[tip].y < hand_landmarks[pip].y - 0.02
         for tip, pip in zip((8, 12, 16, 20), (6, 10, 14, 18))
@@ -607,7 +858,6 @@ def classify_hand_gesture(hand_landmarks):
         if thumb_tip.y > hand_landmarks[0].y + 0.04:
             return "thumbs_down"
         return "closed_fist"
-    index_tip = hand_landmarks[8]
     wrist = hand_landmarks[0]
     index_pip = hand_landmarks[6]
     index_is_extended = index_tip.y < index_pip.y - 0.03
@@ -620,18 +870,28 @@ def classify_hand_gesture(hand_landmarks):
     return "none"
 
 
+def move_mouse_with_hand(virtual_input, hand_landmarks, previous_point):
+    current_point = (hand_landmarks[8].x, hand_landmarks[8].y)
+    if virtual_input is not None and previous_point is not None:
+        delta_x = round((current_point[0] - previous_point[0]) * GESTURE_MOUSE_SENSITIVITY)
+        delta_y = round((current_point[1] - previous_point[1]) * GESTURE_MOUSE_SENSITIVITY)
+        if delta_x or delta_y:
+            virtual_input.mouse("move_relative", delta_x, delta_y)
+    return current_point
+
+
 class GestureStabilizer:
     def __init__(self):
         self.last = None
         self.frames = 0
 
-    def update(self, gesture):
+    def update(self, gesture, required_frames=GESTURE_REQUIRED_FRAMES):
         if gesture == self.last:
             self.frames += 1
         else:
             self.last = gesture
             self.frames = 1
-        return gesture if self.frames == GESTURE_REQUIRED_FRAMES else None
+        return gesture if self.frames == required_frames else None
 
 
 def main():
@@ -640,7 +900,13 @@ def main():
     chat_queue = queue.Queue(maxsize=1)
     web_state = RobotWebState(DEFAULT_MODE)
     chat_stop = threading.Event()
+    tts_queue = queue.Queue(maxsize=1)
     virtual_input = create_virtual_input()
+    web_state.update(input_ready=virtual_input is not None)
+    if virtual_input is None:
+        print("Controle remoto: mouse/teclado indisponiveis; corrija /dev/uinput antes de usar o telefone.")
+    else:
+        print("Controle remoto: mouse/teclado virtuais ativos.")
     web_thread = threading.Thread(
         target=run_web_server,
         args=(web_command_queue, chat_queue, web_state, chat_stop, virtual_input),
@@ -668,12 +934,14 @@ def main():
     frame_index = 0
     last_faces = ()
     last_hand_landmarks = None
+    gesture_mouse_previous = None
     menu_index = 0
     menu_visible = False
     last_menu_interaction = 0.0
     robot_mode = DEFAULT_MODE
     gesture_stabilizer = GestureStabilizer()
     last_gesture_action = 0.0
+    pinch_active = False
     visible_gesture = "none"
     visible_finger_count = 0
     visible_object_detections = []
@@ -685,8 +953,11 @@ def main():
     ollama_inference_active = threading.Event()
     chat_worker_thread = threading.Thread(
         target=ollama_worker,
-        args=(ser, chat_queue, chat_stop, ollama_inference_active, web_state),
+        args=(ser, chat_queue, chat_stop, ollama_inference_active, web_state, tts_queue),
         daemon=True,
+    )
+    tts_thread = threading.Thread(
+        target=tts_worker, args=(tts_queue, chat_stop), daemon=True, name="tts-worker"
     )
     chat_input_thread = threading.Thread(
         target=keyboard_chat_input, args=(chat_queue, chat_stop), daemon=True
@@ -698,6 +969,7 @@ def main():
     watchdog_thread = threading.Thread(target=_watchdog_loop, args=(watchdog_stop,), daemon=True)
     watchdog_thread.start()
     chat_worker_thread.start()
+    tts_thread.start()
     chat_input_thread.start()
 
     try:
@@ -709,11 +981,15 @@ def main():
         camera.start()
         camera.set_controls({"AeEnable": True, "AwbEnable": True})
         cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(WINDOW_NAME, WINDOW_WIDTH, WINDOW_HEIGHT)
+        camera_x, camera_y, camera_width, camera_height = window_layout()["camera"]
+        cv2.resizeWindow(WINDOW_NAME, camera_width, camera_height)
+        cv2.moveWindow(WINDOW_NAME, camera_x, camera_y)
+        if open_monitor_browser():
+            print("Painel do monitor aberto na coluna direita inferior.")
 
         print("Reconhecimento ativo; controle manual por WASD ou setas. ESC para sair.")
         select_robot_mode(ser, robot_mode)
-        print("Teste do menu: M abre; 1-6 selecionam uma funcao; F retorna ao rosto.")
+        print("Teste do menu: M abre; 1-9 selecionam uma funcao; F retorna ao rosto.")
         if not DETECTION_ENABLED:
             print("Deteccao desativada.")
         if not FACE_TRACK_ENABLED:
@@ -734,6 +1010,8 @@ def main():
                         drawing.clear()
                     select_robot_mode(ser, robot_mode)
                     menu_visible = False
+                elif web_command.kind == "youtube_search":
+                    open_youtube_search(web_command.value)
                 elif web_command.kind == "stop":
                     stop_servos(ser)
                     detach_at = None
@@ -793,6 +1071,10 @@ def main():
                         last_hand_landmarks = current_hand
                         visible_finger_count = count_extended_fingers(current_hand, handedness)
                         visible_gesture = classify_hand_gesture(current_hand)
+                        if robot_mode in APP_MODES and not menu_visible:
+                            gesture_mouse_previous = move_mouse_with_hand(
+                                virtual_input, current_hand, gesture_mouse_previous
+                            )
                         if robot_mode == "DRAWING":
                             if visible_finger_count == 1:
                                 drawing.append(
@@ -804,10 +1086,15 @@ def main():
                             elif drawing and drawing[-1] is not None:
                                 drawing.append(None)
                         stable_gesture = gesture_stabilizer.update(
-                            visible_gesture
+                            visible_gesture,
+                            PINCH_REQUIRED_FRAMES
+                            if robot_mode in APP_MODES and visible_gesture == "pinch"
+                            else GESTURE_REQUIRED_FRAMES,
                         )
                         now = time.monotonic()
-                        if stable_gesture and now - last_gesture_action >= GESTURE_COOLDOWN_S:
+                        if stable_gesture and now - last_gesture_action >= (
+                            PINCH_COOLDOWN_S if stable_gesture == "pinch" else GESTURE_COOLDOWN_S
+                        ):
                             if not menu_visible and stable_gesture == "peace":
                                 robot_mode = DEFAULT_MODE
                                 menu_index = ROBOT_MODES.index(DEFAULT_MODE)
@@ -837,10 +1124,21 @@ def main():
                                 last_gesture_action = now
                             elif menu_visible and stable_gesture == "thumbs_down":
                                 send_robot_command(ser, "MENU:CANCEL")
+                                robot_mode = DEFAULT_MODE
+                                select_robot_mode(ser, "FACE")
                                 menu_visible = False
                                 last_gesture_action = now
+                            elif robot_mode in APP_MODES and stable_gesture == "pinch":
+                                if virtual_input is not None and not pinch_active:
+                                    virtual_input.mouse("left")
+                                pinch_active = True
+                                last_gesture_action = now
+                        if visible_gesture != "pinch":
+                            pinch_active = False
                     else:
                         last_hand_landmarks = None
+                        gesture_mouse_previous = None
+                        pinch_active = False
                         visible_gesture = "none"
                         visible_finger_count = 0
                         if robot_mode == "DRAWING" and drawing and drawing[-1] is not None:
@@ -848,14 +1146,19 @@ def main():
                         gesture_stabilizer.update("none")
 
                     if menu_visible and time.monotonic() - last_menu_interaction >= MENU_IDLE_TIMEOUT_S:
-                        send_robot_command(ser, "MODE:FACE")
+                        robot_mode = DEFAULT_MODE
+                        select_robot_mode(ser, "FACE")
                         menu_visible = False
 
                     _set_stage("deteccao_rosto")
-                    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-                    faces = () if robot_mode == "OBJECT_DETECTION" else face_cascade.detectMultiScale(
-                        gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40)
-                    )
+                    if robot_mode in APP_MODES:
+                        faces = ()
+                        last_faces = ()
+                    else:
+                        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+                        faces = () if robot_mode == "OBJECT_DETECTION" else face_cascade.detectMultiScale(
+                            gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40)
+                        )
                     for x, y, width, height in faces:
                         cv2.rectangle(
                             frame_bgr,
@@ -1012,15 +1315,19 @@ def main():
             if normalized_key in (ord("f"), ord("F")):
                 robot_mode = DEFAULT_MODE
                 select_robot_mode(ser, "FACE")
+                menu_visible = False
                 continue
-            if normalized_key in (ord("1"), ord("2"), ord("3"), ord("4"), ord("5"), ord("6")):
+            if ord("1") <= normalized_key <= ord("9"):
                 menu_index = int(chr(normalized_key)) - 1
+                if menu_index >= len(ROBOT_MODES):
+                    continue
                 send_robot_command(ser, f"MENU:INDEX:{menu_index}")
                 robot_mode = ROBOT_MODES[menu_index]
                 if robot_mode == "DRAWING":
                     drawing.clear()
                 select_robot_mode(ser, robot_mode)
                 menu_visible = False
+                gesture_mouse_previous = None
                 continue
             if key & 0xFF == ord(" "):
                 stop_servos(ser)
@@ -1041,6 +1348,7 @@ def main():
                 detach_at = None
     finally:
         chat_stop.set()
+        tts_thread.join(timeout=1.0)
         watchdog_stop.set()
         if hand_detector is not None:
             hand_detector.close()
