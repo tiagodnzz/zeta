@@ -1,6 +1,8 @@
 # Python cache and local environments
 __pycache__/
 *.py[cod]
+.env
+raspberry/.env
 .venv/
 .venv-*/
 

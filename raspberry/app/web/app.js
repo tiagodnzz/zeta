@@ -17,6 +17,8 @@ const voiceButton = document.querySelector('#voice-button');
 const voiceTranscript = document.querySelector('#voice-transcript');
 const voiceStatus = document.querySelector('#voice-status');
 const voiceResponse = document.querySelector('#voice-response');
+const settingsForm = document.querySelector('#settings-form');
+const settingsFeedback = document.querySelector('#settings-feedback');
 const monitorMode = new URLSearchParams(location.search).has('monitor');
 if (monitorMode) document.body.classList.add('monitor-mode');
 
@@ -100,6 +102,10 @@ function render(state) {
   lastMessage.textContent = state.last_message;
   heroMessage.textContent = state.chat_busy ? 'Estou pensando...' : state.last_message;
   telemetry.textContent = `Gesto: ${state.gesture} · Dedos: ${state.finger_count}`;
+  if (window.zetaMicListening !== state.mic_listening) {
+    window.zetaMicListening = state.mic_listening;
+    window.dispatchEvent(new CustomEvent('zeta-mic', {detail: {listening: state.mic_listening}}));
+  }
   if (inputFeedback && state.input_ready === false) {
     inputFeedback.textContent = 'Mouse e teclado indisponiveis: verifique /dev/uinput no Raspberry.';
     inputFeedback.classList.add('error');
@@ -116,6 +122,15 @@ function render(state) {
     if (lastResponse && voiceResponse) voiceResponse.textContent = lastResponse.text;
   }
   renderMetrics(state.metrics);
+}
+
+function renderSettings(settings) {
+  if (!settingsForm) return;
+  document.querySelector('#setting-tts').checked = settings.tts_enabled;
+  document.querySelector('#setting-ai').value = settings.ai_provider;
+  document.querySelector('#setting-transcription').value = settings.transcription_provider;
+  document.querySelector('#setting-navigation').value = settings.menu_navigation;
+  document.querySelector('#setting-dwell').value = settings.menu_dwell_time_s;
 }
 
 async function post(path, body) {
@@ -163,48 +178,113 @@ if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
   let recorder = null;
   let microphoneStream = null;
   let audioChunks = [];
+  let microphoneReady = false;
+
+  async function authorizeMicrophone() {
+    const stream = await navigator.mediaDevices.getUserMedia({audio: true});
+    stream.getTracks().forEach((track) => track.stop());
+    microphoneReady = true;
+    voiceStatus.textContent = 'microfone autorizado; faca o gesto shaka';
+  }
+
+  async function createRecorder() {
+    microphoneStream = await navigator.mediaDevices.getUserMedia({audio: {
+      channelCount: 1,
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+    }});
+    const mimeType = ['audio/webm;codecs=opus', 'audio/ogg;codecs=opus', 'audio/webm']
+      .find((type) => MediaRecorder.isTypeSupported(type));
+    recorder = new MediaRecorder(microphoneStream, {
+      ...(mimeType ? {mimeType} : {}),
+      audioBitsPerSecond: 128000,
+    });
+    recorder.addEventListener('dataavailable', (event) => {
+      if (event.data.size) audioChunks.push(event.data);
+    });
+    recorder.addEventListener('start', () => {
+      voiceButton.classList.add('listening');
+      voiceButton.setAttribute('aria-pressed', 'true');
+      voiceStatus.textContent = 'ouvindo pelo gesto shaka...';
+      voiceTranscript.textContent = 'Fale agora...';
+    });
+    recorder.addEventListener('stop', async () => {
+      voiceButton.classList.remove('listening');
+      voiceButton.setAttribute('aria-pressed', 'false');
+      voiceStatus.textContent = 'enviando ao Groq...';
+      microphoneStream?.getTracks().forEach((track) => track.stop());
+      const blob = new Blob(audioChunks, {type: recorder.mimeType || 'audio/webm'});
+      recorder = null;
+      microphoneReady = false;
+      audioChunks = [];
+      if (!blob.size) {
+        voiceStatus.textContent = 'nenhum audio capturado';
+        return;
+      }
+      const body = new FormData();
+      body.append('audio', blob, 'voice.webm');
+      const controller = new AbortController();
+      const timeout = window.setTimeout(() => controller.abort(), 180000);
+      try {
+        const response = await fetch('/api/transcribe', {method: 'POST', body, signal: controller.signal});
+        const result = await response.json();
+        if (!response.ok || result.accepted === false) throw new Error(result.error || 'falha na transcricao');
+        voiceTranscript.textContent = result.text;
+        voiceStatus.textContent = 'transcricao enviada ao Groq';
+      } catch (error) {
+        voiceStatus.textContent = error.name === 'AbortError'
+          ? 'a transcricao demorou mais de 3 minutos'
+          : (error.message || 'falha na transcricao');
+      } finally {
+        window.clearTimeout(timeout);
+      }
+    });
+    microphoneReady = true;
+  }
+
+  async function startRecording() {
+    if (!microphoneReady) await createRecorder();
+    if (recorder?.state !== 'recording') {
+      audioChunks = [];
+      recorder.start();
+    }
+  }
+
   voiceButton.addEventListener('click', async () => {
+    if (!microphoneReady) {
+      try {
+        await authorizeMicrophone();
+        if (window.zetaMicListening) await startRecording();
+      } catch (error) {
+        voiceStatus.textContent = error.name === 'NotAllowedError'
+          ? 'permissao do microfone negada neste navegador'
+          : 'nao foi possivel acessar o microfone';
+      }
+      return;
+    }
     if (recorder?.state === 'recording') {
       recorder.stop();
       return;
     }
     try {
-      microphoneStream = await navigator.mediaDevices.getUserMedia({audio: true});
-      audioChunks = [];
-      recorder = new MediaRecorder(microphoneStream);
-      recorder.addEventListener('dataavailable', (event) => {
-        if (event.data.size) audioChunks.push(event.data);
-      });
-      recorder.addEventListener('start', () => {
-        voiceButton.classList.add('listening');
-        voiceButton.setAttribute('aria-pressed', 'true');
-        voiceStatus.textContent = 'ouvindo... toque novamente para enviar';
-        voiceTranscript.textContent = 'Fale agora...';
-      });
-      recorder.addEventListener('stop', async () => {
-        voiceButton.classList.remove('listening');
-        voiceButton.setAttribute('aria-pressed', 'false');
-        voiceStatus.textContent = 'transcrevendo localmente...';
-        microphoneStream?.getTracks().forEach((track) => track.stop());
-        const blob = new Blob(audioChunks, {type: recorder.mimeType || 'audio/webm'});
-        const body = new FormData();
-        body.append('audio', blob, 'voice.webm');
-        try {
-          const response = await fetch('/api/transcribe', {method: 'POST', body});
-          const result = await response.json();
-          if (!response.ok || result.accepted === false) throw new Error(result.error || 'falha na transcricao');
-          voiceTranscript.textContent = result.text;
-          voiceStatus.textContent = 'transcricao enviada';
-        } catch (error) {
-          voiceStatus.textContent = error.message || 'falha na transcricao';
-        }
-      });
-      recorder.start();
+      await startRecording();
     } catch (error) {
       voiceStatus.textContent = error.name === 'NotAllowedError'
-        ? 'permissao do microfone negada neste navegador'
+        ? 'clique no microfone para autorizar a captura'
         : 'nao foi possivel acessar o microfone';
     }
+  });
+  voiceStatus.textContent = 'clique no microfone uma vez para autorizar o shaka';
+  window.addEventListener('zeta-mic', (event) => {
+    if (event.detail.listening && recorder?.state !== 'recording') {
+      startRecording().catch((error) => {
+        voiceStatus.textContent = error.name === 'NotAllowedError'
+          ? 'clique no microfone para autorizar a captura'
+          : (error.message || 'nao foi possivel iniciar o microfone');
+      });
+    }
+    if (!event.detail.listening && recorder?.state === 'recording') recorder.stop();
   });
 }
 terminalForm.addEventListener('submit', async (event) => {
@@ -332,3 +412,22 @@ function connect() {
 
 fetch('/api/status').then((response) => response.json()).then(render);
 connect();
+fetch('/api/settings').then((response) => response.json()).then(renderSettings);
+settingsForm?.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const response = await fetch('/api/settings', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      tts_enabled: document.querySelector('#setting-tts').checked,
+      ai_provider: document.querySelector('#setting-ai').value,
+      transcription_provider: document.querySelector('#setting-transcription').value,
+      menu_navigation: document.querySelector('#setting-navigation').value,
+      menu_dwell_time_s: Number(document.querySelector('#setting-dwell').value),
+    }),
+  });
+  const result = await response.json();
+  settingsFeedback.textContent = result.accepted
+    ? 'Preferências salvas. Reinicie o Zeta para aplicar.'
+    : (result.error || 'Não foi possível salvar.');
+});

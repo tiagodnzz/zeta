@@ -10,3 +10,4 @@ websockets
 evdev
 faster-whisper
 python-multipart
+groq

@@ -11,6 +11,7 @@ from glob import glob
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import config
 from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
@@ -19,11 +20,18 @@ from .input_controller import VirtualInput
 
 ROBOT_MODES = (
     "FOLLOW_HAND", "FOLLOW_FACE", "COUNT_FINGERS",
-    "OBJECT_DETECTION", "DATE_TIME", "DRAWING", "YOUTUBE", "SPOTIFY", "BROWSER",
+    "OBJECT_DETECTION", "DATE_TIME", "DRAWING", "YOUTUBE", "SPOTIFY", "BROWSER", "SYSTEM",
 )
 WEB_HOST = os.environ.get("ZETA_WEB_HOST", "0.0.0.0")
 WEB_PORT = int(os.environ.get("ZETA_WEB_PORT", "8080"))
 WEB_ROOT = Path(__file__).with_name("web")
+CONFIG_KEYS = {
+    "tts_enabled": ("ZETA_TTS_ENABLED", lambda value: "1" if value else "0"),
+    "ai_provider": ("ZETA_AI_PROVIDER", lambda value: value),
+    "transcription_provider": ("ZETA_TRANSCRIPTION_PROVIDER", lambda value: value),
+    "menu_navigation": ("ZETA_MENU_NAVIGATION", lambda value: value),
+    "menu_dwell_time_s": ("ZETA_MENU_DWELL_TIME_S", lambda value: f"{value:.1f}"),
+}
 
 
 @dataclass
@@ -60,12 +68,35 @@ class ServoRequest(BaseModel):
     y: float
 
 
-WHISPER_MODEL_NAME = os.environ.get("ZETA_WHISPER_MODEL", "tiny")
+class SettingsRequest(BaseModel):
+    tts_enabled: bool = True
+    ai_provider: str = "ollama"
+    transcription_provider: str = "local"
+    menu_navigation: str = "gestures"
+    menu_dwell_time_s: float = 1.5
+
+
+WHISPER_MODEL_NAME = os.environ.get("ZETA_WHISPER_MODEL", "small")
 WHISPER_DEVICE = os.environ.get("ZETA_WHISPER_DEVICE", "cpu")
 WHISPER_COMPUTE_TYPE = os.environ.get("ZETA_WHISPER_COMPUTE_TYPE", "int8")
 WHISPER_CPU_THREADS = int(os.environ.get("ZETA_WHISPER_CPU_THREADS", str(os.cpu_count() or 1)))
+WHISPER_BEAM_SIZE = int(os.environ.get("ZETA_WHISPER_BEAM_SIZE", "5"))
+WHISPER_INITIAL_PROMPT = os.environ.get(
+    "ZETA_WHISPER_INITIAL_PROMPT",
+    "Comandos em portugues do Brasil para controlar o robo e pesquisar no YouTube.",
+)
+TRANSCRIPTION_PROVIDER = os.environ.get("ZETA_TRANSCRIPTION_PROVIDER", "local").strip().lower()
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
+GROQ_TRANSCRIPTION_MODEL = os.environ.get(
+    "ZETA_GROQ_TRANSCRIPTION_MODEL", "whisper-large-v3-turbo"
+)
+GROQ_TRANSCRIPTION_TEMPERATURE = float(
+    os.environ.get("ZETA_GROQ_TRANSCRIPTION_TEMPERATURE", "0")
+)
 _whisper_model = None
 _whisper_model_lock = threading.Lock()
+_groq_client = None
+_groq_client_lock = threading.Lock()
 
 
 def youtube_search_query(text):
@@ -81,7 +112,31 @@ def youtube_search_query(text):
     return query or None
 
 
-def transcribe_audio(audio, suffix):
+def transcribe_audio_groq(audio, suffix):
+    global _groq_client
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY nao foi configurada.")
+    try:
+        from groq import Groq
+    except ImportError as error:
+        raise RuntimeError("A biblioteca groq nao esta instalada no ambiente do Zeta.") from error
+
+    if _groq_client is None:
+        with _groq_client_lock:
+            if _groq_client is None:
+                _groq_client = Groq(api_key=GROQ_API_KEY)
+    transcription = _groq_client.audio.transcriptions.create(
+        file=(f"voice{suffix}", audio),
+        model=GROQ_TRANSCRIPTION_MODEL,
+        language="pt",
+        temperature=GROQ_TRANSCRIPTION_TEMPERATURE,
+        response_format="verbose_json",
+    )
+    text = getattr(transcription, "text", "")
+    return text.strip()
+
+
+def transcribe_audio_local(audio, suffix):
     global _whisper_model
     try:
         from faster_whisper import WhisperModel
@@ -104,6 +159,7 @@ def transcribe_audio(audio, suffix):
         conversion = subprocess.run(
             (
                 "ffmpeg", "-nostdin", "-loglevel", "error", "-i", str(input_path),
+                "-vn", "-af", "highpass=f=80,lowpass=f=7600,loudnorm=I=-16:LRA=11:TP=-1.5",
                 "-f", "s16le", "-ar", "16000", "-ac", "1", "pipe:1",
             ),
             capture_output=True,
@@ -121,14 +177,32 @@ def transcribe_audio(audio, suffix):
         segments, _ = _whisper_model.transcribe(
             audio_samples,
             language="pt",
-            beam_size=1,
-            best_of=1,
+            beam_size=WHISPER_BEAM_SIZE,
+            best_of=WHISPER_BEAM_SIZE,
             temperature=0,
+            initial_prompt=WHISPER_INITIAL_PROMPT,
+            no_speech_threshold=0.4,
+            log_prob_threshold=-1.0,
+            compression_ratio_threshold=2.4,
             condition_on_previous_text=False,
             vad_filter=True,
-            vad_parameters={"min_silence_duration_ms": 300},
+            vad_parameters={
+                "min_silence_duration_ms": 500,
+                "speech_pad_ms": 250,
+                "min_speech_duration_ms": 120,
+            },
         )
         return " ".join(segment.text.strip() for segment in segments).strip()
+
+
+def transcribe_audio(audio, suffix):
+    if TRANSCRIPTION_PROVIDER == "groq":
+        return transcribe_audio_groq(audio, suffix)
+    if TRANSCRIPTION_PROVIDER == "local":
+        return transcribe_audio_local(audio, suffix)
+    raise RuntimeError(
+        f"Provedor de transcricao invalido: {TRANSCRIPTION_PROVIDER}. Use groq ou local."
+    )
 
 
 def read_system_metrics():
@@ -165,6 +239,51 @@ def read_system_metrics():
     return metrics
 
 
+def read_public_settings():
+    return {
+        "tts_enabled": os.environ.get("ZETA_TTS_ENABLED", "1") != "0",
+        "ai_provider": os.environ.get("ZETA_AI_PROVIDER", "groq" if os.environ.get("GROQ_API_KEY") else "ollama"),
+        "transcription_provider": os.environ.get("ZETA_TRANSCRIPTION_PROVIDER", "local"),
+        "menu_navigation": os.environ.get("ZETA_MENU_NAVIGATION", "gestures"),
+        "menu_dwell_time_s": float(os.environ.get("ZETA_MENU_DWELL_TIME_S", "1.5")),
+    }
+
+
+def save_public_settings(settings):
+    values = {
+        "tts_enabled": settings.tts_enabled,
+        "ai_provider": settings.ai_provider.strip().lower(),
+        "transcription_provider": settings.transcription_provider.strip().lower(),
+        "menu_navigation": settings.menu_navigation.strip().lower(),
+        "menu_dwell_time_s": round(float(settings.menu_dwell_time_s), 1),
+    }
+    if values["ai_provider"] not in {"groq", "ollama"}:
+        raise ValueError("Provedor de conversa invalido.")
+    if values["transcription_provider"] not in {"groq", "local"}:
+        raise ValueError("Provedor de transcricao invalido.")
+    if values["menu_navigation"] not in {"gestures", "pointer"}:
+        raise ValueError("Modo de navegacao invalido.")
+    if not 0.5 <= values["menu_dwell_time_s"] <= 5.0:
+        raise ValueError("O tempo de selecao deve estar entre 0,5 e 5 segundos.")
+    env_path = config.ENV_FILE
+    lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
+    replacements = {key: formatter(values[name]) for name, (key, formatter) in CONFIG_KEYS.items()}
+    found = set()
+    updated_lines = []
+    for line in lines:
+        key = line.split("=", 1)[0].strip() if "=" in line and not line.lstrip().startswith("#") else ""
+        if key in replacements:
+            updated_lines.append(f"{key}={replacements[key]}")
+            found.add(key)
+        else:
+            updated_lines.append(line)
+    for key, value in replacements.items():
+        if key not in found:
+            updated_lines.append(f"{key}={value}")
+    env_path.write_text("\n".join(updated_lines).rstrip() + "\n", encoding="utf-8")
+    return values
+
+
 class RobotWebState:
     def __init__(self, mode: str):
         self._lock = threading.Lock()
@@ -172,6 +291,7 @@ class RobotWebState:
             "mode": mode,
             "gesture": "none",
             "finger_count": 0,
+            "mic_listening": False,
             "objects": [],
             "last_message": "Pronto",
             "chat_busy": False,
@@ -253,7 +373,14 @@ def run_terminal_command(command):
     return output[-4000:] or f"codigo de saida: {result.returncode}"
 
 
-def create_app(command_queue, chat_queue, state: RobotWebState, stop_event, virtual_input=None):
+def create_app(
+    command_queue,
+    chat_queue,
+    state: RobotWebState,
+    stop_event,
+    virtual_input=None,
+    inference_active=None,
+):
     app = FastAPI(title="Zeta", version="0.1.0")
 
     @app.get("/")
@@ -301,6 +428,18 @@ def create_app(command_queue, chat_queue, state: RobotWebState, stop_event, virt
         state.update(metrics=read_system_metrics())
         return state.snapshot()
 
+    @app.get("/api/settings")
+    async def settings():
+        return read_public_settings()
+
+    @app.post("/api/settings")
+    async def update_settings(request: SettingsRequest):
+        try:
+            values = save_public_settings(request)
+        except (OSError, ValueError) as error:
+            return {"accepted": False, "error": str(error)}
+        return {"accepted": True, "settings": values, "restart_required": True}
+
     @app.post("/api/chat")
     async def chat(request: ChatRequest):
         text = " ".join(request.text.split())
@@ -323,19 +462,34 @@ def create_app(command_queue, chat_queue, state: RobotWebState, stop_event, virt
     async def transcribe(audio: UploadFile = File(...)):
         content_type = audio.content_type or ""
         suffix = ".webm" if "webm" in content_type else ".ogg"
+        audio_bytes = await audio.read()
+        if not audio_bytes:
+            return {"accepted": False, "error": "O audio gravado ficou vazio."}
+        print(
+            f"Transcricao iniciada: {len(audio_bytes)} bytes, tipo={content_type or 'desconhecido'}",
+            flush=True,
+        )
+        if inference_active is not None:
+            inference_active.set()
         try:
-            text = await asyncio.to_thread(transcribe_audio, await audio.read(), suffix)
-        except (OSError, RuntimeError, UnicodeError) as error:
+            text = await asyncio.to_thread(transcribe_audio_groq, audio_bytes, suffix)
+        except Exception as error:
+            print(f"Falha na transcricao: {error!r}", flush=True)
             return {"accepted": False, "error": str(error)}
+        finally:
+            if inference_active is not None:
+                inference_active.clear()
         if not text:
+            print("Transcricao concluida sem fala detectada.", flush=True)
             return {"accepted": False, "error": "Nenhuma fala detectada."}
+        print(f"Transcricao concluida: {text}", flush=True)
         youtube_query = youtube_search_query(text)
         if youtube_query:
             command_queue.put_nowait(WebCommand("youtube_search", quote_plus(youtube_query)))
             state.add_chat_message(text, "outgoing")
             return {"accepted": True, "text": text, "youtube_search": youtube_query}
         try:
-            chat_queue.put_nowait(text)
+            chat_queue.put_nowait(("groq", text))
         except Exception:
             return {"accepted": False, "error": "Zeta ainda esta respondendo."}
         state.update(chat_busy=True, last_message="Pensando...")
@@ -412,7 +566,14 @@ def create_app(command_queue, chat_queue, state: RobotWebState, stop_event, virt
     return app
 
 
-def run_web_server(command_queue, chat_queue, state, stop_event, virtual_input=None):
+def run_web_server(
+    command_queue,
+    chat_queue,
+    state,
+    stop_event,
+    virtual_input=None,
+    inference_active=None,
+):
     import uvicorn
 
     threading.Thread(
@@ -421,5 +582,12 @@ def run_web_server(command_queue, chat_queue, state, stop_event, virtual_input=N
         daemon=True,
         name="desktop-capture",
     ).start()
-    app = create_app(command_queue, chat_queue, state, stop_event, virtual_input)
+    app = create_app(
+        command_queue,
+        chat_queue,
+        state,
+        stop_event,
+        virtual_input,
+        inference_active,
+    )
     uvicorn.run(app, host=WEB_HOST, port=WEB_PORT, log_level="info")

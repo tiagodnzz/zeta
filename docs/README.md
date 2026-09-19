@@ -87,6 +87,43 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
+### Respostas rápidas com Groq
+
+O chat usa a API da Groq quando `GROQ_API_KEY` está definida. O projeto lê
+automaticamente `raspberry/.env`; crie esse arquivo a partir do modelo, sem
+versionar a cópia que contém a chave:
+
+```bash
+cp .env.example .env
+${EDITOR:-nano} .env
+```
+
+Preencha pelo menos:
+
+```env
+ZETA_AI_PROVIDER=groq
+GROQ_API_KEY=sua-chave-da-groq
+GROQ_MODEL=openai/gpt-oss-120b
+GROQ_TEMPERATURE=1
+GROQ_MAX_COMPLETION_TOKENS=2048
+GROQ_TOP_P=1
+GROQ_REASONING_EFFORT=medium
+```
+
+Depois, inicie normalmente:
+
+```bash
+cd raspberry
+source .venv/bin/activate
+python main.py
+```
+
+O modelo pode ser alterado conforme os modelos disponíveis na sua conta. Para
+forçar o provedor local, use `ZETA_AI_PROVIDER=ollama` no `.env`; sem uma chave
+Groq, o programa também seleciona Ollama automaticamente. Variáveis exportadas
+no sistema têm prioridade sobre os valores do arquivo. A integração usa o SDK
+oficial `groq`, instalado pelo `requirements.txt`.
+
 O parâmetro `--system-site-packages` permite que o ambiente virtual encontre o `picamera2` e o `opencv` instalados pelo `apt`, mantendo isoladas as dependências instaladas pelo `pip`. Para sair do ambiente virtual:
 
 ```bash
@@ -110,15 +147,18 @@ O programa baixa automaticamente, na primeira execução, os arquivos necessári
 
 ## Portal do usuário
 
-Com o Zeta em execução, abra `http://IP_DO_RASPBERRY:8080` no telefone conectado à mesma rede. O portal é dividido em cinco áreas:
+Com o Zeta em execução, abra `http://IP_DO_RASPBERRY:8080` no telefone conectado à mesma rede. O portal é dividido em seis áreas:
 
 - **Início**: carinha do Zeta, resumo de CPU, memória, temperatura e chat.
 - **Visão**: vídeo processado da câmera, com botão de tela cheia.
 - **Computador**: captura do desktop Wayland em tela cheia, touchpad, cliques, arraste e teclado virtual.
 - **Robô**: seleção dos modos e parada dos servos.
 - **Sistema**: métricas contínuas do Raspberry e terminal de diagnóstico com comandos restritos.
+- **Configuração**: habilita ou desabilita a fala do robô e escolhe os provedores local ou pela internet para conversa e transcrição.
 
-As métricas são lidas diretamente do sistema Linux e mostram CPU, memória e temperatura enquanto a visão computacional ou o Ollama estão ativos.
+A área **Configuração** salva apenas preferências não sensíveis em `raspberry/.env`. As chaves de API nunca são exibidas nem alteradas pelo portal. Depois de salvar, reinicie o Zeta para carregar os novos provedores e a preferência de fala.
+
+As métricas são lidas diretamente do sistema Linux e mostram CPU, memória e temperatura enquanto a visão computacional ou o provedor de IA estão ativos.
 
 Os modos **YouTube + mão**, **Spotify + mão** e **Navegador + mão** abrem o endereço correspondente no Chromium no Raspberry. Ao selecionar novamente o mesmo aplicativo, o Zeta apenas tenta trazer a janela existente para frente. Com um desses modos ativo, a ponta do dedo indicador move o ponteiro do desktop e a aproximação do polegar com o indicador (pinça) faz um clique esquerdo rapidamente; mantenha a pinça por um instante e abra a mão antes do próximo clique. Ao cancelar o menu, deixar o menu expirar ou pressionar `F`, o modo volta para **Seguir rosto** e o Chromium continua aberto. O Chromium precisa estar instalado e o usuário precisa ter acesso a `/dev/uinput`.
 
@@ -163,6 +203,8 @@ O rastreamento automático usa o maior rosto detectado. A posição é suavizada
 
 O detector de mão usa o modo `VIDEO` do MediaPipe, mantendo o contexto entre quadros para reduzir o custo de processamento no Raspberry Pi e evitar que a captura fique acumulada.
 
+No display do ESP32 e na visão da câmera, o menu mostra botões com o item selecionado, o anterior e o seguinte. A visão exibe sempre o modo ativo: **MODO: GESTOS** ou **MODO: DEDO + TEMPO**, junto da ação necessária. Há dois modos de navegação: **Gestos**, que usa apontar esquerda/direita e punho ou polegar para cima; e **Cursor pela visão**, que usa o indicador como cursor e seleciona ao permanecer sobre um botão. A pizza circular mostra o tempo restante. Os cartões da visão usam os mesmos PNGs dos ícones armazenados em `esp32/src/icons` e compilados em `esp32/src/icons.h`. Polegar para baixo cancela. O item **Sistema** abre uma tela com CPU, RAM e temperatura do Raspberry; esses valores são atualizados uma vez por segundo.
+
 ## Protocolo serial
 
 A comunicação usa **115200 baud**, uma linha por comando, terminada em `\\n`:
@@ -170,6 +212,8 @@ A comunicação usa **115200 baud**, uma linha por comando, terminada em `\\n`:
 ```text
 X:<angulo>,Y:<angulo>
 OFF
+SCREEN:SYSTEM
+SYSTEM:CPU:<cpu>:<ram>:<temperatura>
 ```
 
 Exemplos:

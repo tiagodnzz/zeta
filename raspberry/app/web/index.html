@@ -20,6 +20,7 @@
       <button class="nav-tab" data-view-target="computer"><span>▣</span> Computador</button>
       <button class="nav-tab" data-view-target="robot"><span>✦</span> Robô</button>
       <button class="nav-tab" data-view-target="system"><span>⌁</span> Sistema</button>
+      <button class="nav-tab" data-view-target="settings"><span>⚙</span> Configuração</button>
     </nav>
 
     <section class="view active" data-view="home">
@@ -62,6 +63,18 @@
       <div class="section-heading"><div><span class="eyebrow">OBSERVABILIDADE</span><h2>Desempenho</h2></div><span class="live-dot">ATUALIZAÇÃO CONTÍNUA</span></div>
       <div class="performance panel"><div class="perf-row"><div><span>CPU</span><strong id="perf-cpu">--</strong></div><div class="meter"><i id="meter-cpu"></i></div></div><div class="perf-row"><div><span>MEMÓRIA</span><strong id="perf-memory">--</strong></div><div class="meter"><i id="meter-memory"></i></div></div><div class="perf-row"><div><span>TEMPERATURA</span><strong id="perf-temp">--</strong></div><div class="temperature-line"><i id="meter-temp"></i></div></div><p class="perf-note">As métricas mostram a carga geral do Raspberry durante a visão computacional e o uso do Ollama. O estado do chat indica quando o LLM está processando.</p></div>
       <details class="terminal panel"><summary><span>›_</span> Terminal de diagnóstico</summary><div class="terminal-output" id="terminal-output">Comandos permitidos: pwd, ls, ip, uptime, df, free, date</div><form id="terminal-form"><input id="terminal-input" autocomplete="off" placeholder="ex.: uptime"><button type="submit">executar</button></form></details>
+    </section>
+
+    <section class="view" data-view="settings">
+      <div class="section-heading"><div><span class="eyebrow">PREFERÊNCIAS</span><h2>Configuração do Zeta</h2></div></div>
+      <form id="settings-form" class="settings-panel panel">
+        <label class="setting-row"><span><strong>Fala do robô</strong><small>Reproduz respostas com o Piper.</small></span><input id="setting-tts" type="checkbox"></label>
+        <label class="setting-row"><span><strong>Conversa</strong><small>Escolha entre Groq pela internet e Ollama local.</small></span><select id="setting-ai"><option value="groq">Groq · internet</option><option value="ollama">Ollama · local</option></select></label>
+        <label class="setting-row"><span><strong>Transcrição</strong><small>Escolha entre Groq rápido e Whisper local.</small></span><select id="setting-transcription"><option value="groq">Groq · internet</option><option value="local">Whisper · local</option></select></label>
+        <label class="setting-row"><span><strong>Navegação do menu</strong><small>Use gestos discretos ou o cursor do dedo.</small></span><select id="setting-navigation"><option value="gestures">Gestos</option><option value="pointer">Cursor pela visão</option></select></label>
+        <label class="setting-row"><span><strong>Tempo de seleção</strong><small>Tempo sobre o botão até confirmar.</small></span><input id="setting-dwell" type="number" min="0.5" max="5" step="0.1" value="1.5"> <span>s</span></label>
+        <button type="submit">Salvar preferências</button><p id="settings-feedback" class="input-feedback" role="status"></p>
+      </form>
     </section>
   </main>
   <script src="/app.js"></script>

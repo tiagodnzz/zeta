@@ -28,8 +28,8 @@ constexpr uint16_t kMouthColor = TFT_CYAN;
 constexpr unsigned long kIdleDelayMs = 1800;
 constexpr unsigned long kIdleCycleMs = 24000;
 constexpr uint16_t kMenuAccentColor = TFT_YELLOW;
-constexpr uint8_t kMenuItemCount = 9;
-const char* const kMenuLabels[kMenuItemCount] = {"SEGUIR MAO", "SEGUIR ROSTO", "CONTAR DEDOS", "OBJETOS", "DATA E HORA", "DESENHAR", "YOUTUBE", "SPOTIFY", "NAVEGADOR"};
+constexpr uint8_t kMenuItemCount = 10;
+const char* const kMenuLabels[kMenuItemCount] = {"SEGUIR MAO", "SEGUIR ROSTO", "CONTAR DEDOS", "OBJETOS", "DATA E HORA", "DESENHAR", "YOUTUBE", "SPOTIFY", "NAVEGADOR", "SISTEMA"};
 constexpr int16_t kMainEyeRadius = 8;
 constexpr int16_t kMainEyeGap = 64;
 constexpr int16_t kMainMouthWidth = 32;
@@ -58,7 +58,12 @@ bool g_lastBlinking = false;
 int8_t g_idlePhase = -1;
 bool g_menuVisible = false;
 bool g_modeScreenVisible = false;
+bool g_systemScreenVisible = false;
 uint8_t g_menuIndex = 0;
+float g_systemCpu = 0.0f;
+float g_systemMemory = 0.0f;
+float g_systemTemperature = 0.0f;
+bool g_systemTemperatureValid = false;
 String g_statusText = "Pronto";
 String g_dialogVisibleText;
 unsigned long g_dialogStartedAt = 0;
@@ -196,7 +201,28 @@ void drawMiniFace(int16_t centerX, int16_t centerY, bool blinking = false,
   }
 }
 
+const uint16_t* menuIconForIndex(uint8_t index);
+void drawGestureIcon(int16_t centerX, int16_t centerY);
+
 void drawMenuIcon(uint8_t index, int16_t centerX, int16_t centerY) {
+  if (index == 5) {
+    drawGestureIcon(centerX, centerY);
+    return;
+  }
+  const uint16_t* bitmap = menuIconForIndex(index);
+  if (bitmap != nullptr) {
+    constexpr int16_t iconSize = 40;
+    for (int16_t y = 0; y < iconSize; y++) {
+      for (int16_t x = 0; x < iconSize; x++) {
+        const int16_t sourceX = x * kIconWidth / iconSize;
+        const int16_t sourceY = y * kIconHeight / iconSize;
+        g_tft.drawPixel(centerX - iconSize / 2 + x,
+                        centerY - iconSize / 2 + y,
+                        pgm_read_word(&bitmap[sourceY * kIconWidth + sourceX]));
+      }
+    }
+    return;
+  }
   if (index == 0) {
     g_tft.drawRoundRect(centerX - 16, centerY - 1, 32, 31, 10, kEyeColor);
     for (int8_t finger = -2; finger <= 2; finger++) {
@@ -349,36 +375,79 @@ void drawMenu() {
   g_tft.fillScreen(kBackgroundColor);
   g_tft.setTextDatum(MC_DATUM);
   const int16_t centerX = g_tft.width() / 2;
-  const int16_t centerY = 116;
+  const int16_t centerY = 126;
   g_tft.setTextColor(kEyeColor, kBackgroundColor);
   g_tft.setTextSize(2);
   g_tft.drawString("MENU", centerX, 18);
   g_tft.setTextSize(1);
   g_tft.drawString(String(g_menuIndex + 1) + "/" + String(kMenuItemCount), centerX, 39);
 
-  g_tft.drawRoundRect(42, 62, g_tft.width() - 84, 112, 10, kMenuAccentColor);
-  g_tft.setTextSize(4);
-  g_tft.setTextColor(kMenuAccentColor, kBackgroundColor);
-  g_tft.drawLine(25, centerY, 10, centerY, kMenuAccentColor);
-  g_tft.drawLine(10, centerY, 18, centerY - 8, kMenuAccentColor);
-  g_tft.drawLine(10, centerY, 18, centerY + 8, kMenuAccentColor);
-  g_tft.drawLine(g_tft.width() - 25, centerY, g_tft.width() - 10, centerY, kMenuAccentColor);
-  g_tft.drawLine(g_tft.width() - 10, centerY, g_tft.width() - 18, centerY - 8, kMenuAccentColor);
-  g_tft.drawLine(g_tft.width() - 10, centerY, g_tft.width() - 18, centerY + 8, kMenuAccentColor);
-  const int16_t iconX = centerX - kIconWidth / 2;
-  const int16_t iconY = centerY - kIconHeight / 2;
-  const uint16_t* menuIcon = menuIconForIndex(g_menuIndex);
-  if (menuIcon != nullptr) {
-    g_tft.pushImage(iconX, iconY, kIconWidth, kIconHeight, menuIcon);
-  } else {
-    drawGestureIcon(centerX, centerY);
+  const uint8_t visibleIndexes[4] = {
+    g_menuIndex,
+    static_cast<uint8_t>((g_menuIndex + 1) % kMenuItemCount),
+    static_cast<uint8_t>((g_menuIndex + 2) % kMenuItemCount),
+    static_cast<uint8_t>((g_menuIndex + 3) % kMenuItemCount),
+  };
+  const int16_t gridLeft = 22;
+  const int16_t gridRight = g_tft.width() - 22;
+  const int16_t gridTop = 58;
+  const int16_t gridBottom = 188;
+  const int16_t gridGapX = 10;
+  const int16_t gridGapY = 10;
+  const int16_t cardWidth = (gridRight - gridLeft - gridGapX) / 2;
+  const int16_t cardHeight = (gridBottom - gridTop - gridGapY) / 2;
+  const int16_t cardCentersX[4] = {
+    static_cast<int16_t>(gridLeft + cardWidth / 2),
+    static_cast<int16_t>(gridLeft + cardWidth + gridGapX + cardWidth / 2),
+    static_cast<int16_t>(gridLeft + cardWidth / 2),
+    static_cast<int16_t>(gridLeft + cardWidth + gridGapX + cardWidth / 2),
+  };
+  const int16_t cardCentersY[4] = {
+    static_cast<int16_t>(gridTop + cardHeight / 2),
+    static_cast<int16_t>(gridTop + cardHeight / 2),
+    static_cast<int16_t>(gridTop + cardHeight + gridGapY + cardHeight / 2),
+    static_cast<int16_t>(gridTop + cardHeight + gridGapY + cardHeight / 2),
+  };
+  for (uint8_t card = 0; card < 4; card++) {
+    const bool selected = card == 0;
+    const int16_t cardX = cardCentersX[card];
+    const int16_t cardY = cardCentersY[card];
+    const uint16_t color = selected ? kMenuAccentColor : kEyeColor;
+    g_tft.drawRoundRect(cardX - cardWidth / 2, cardY - cardHeight / 2,
+              cardWidth, cardHeight, 8, color);
+    drawMenuIcon(visibleIndexes[card], cardX, cardY - 7);
+    g_tft.setTextColor(color, kBackgroundColor);
+    g_tft.setTextSize(1);
+    g_tft.drawString(kMenuLabels[visibleIndexes[card]], cardX, cardY + 21);
   }
-  g_tft.setTextSize(2);
   g_tft.setTextColor(kMenuAccentColor, kBackgroundColor);
-  g_tft.drawString(kMenuLabels[g_menuIndex], centerX, 190);
+  g_tft.drawLine(14, centerY, 24, centerY - 6, kMenuAccentColor);
+  g_tft.drawLine(14, centerY, 24, centerY + 6, kMenuAccentColor);
+  g_tft.drawLine(g_tft.width() - 14, centerY, g_tft.width() - 24, centerY - 6, kMenuAccentColor);
+  g_tft.drawLine(g_tft.width() - 14, centerY, g_tft.width() - 24, centerY + 6, kMenuAccentColor);
   g_tft.setTextColor(kEyeColor, kBackgroundColor);
   g_tft.setTextSize(1);
-  g_tft.drawString("JOIA CONFIRMA", centerX, 237);
+  g_tft.drawString("PUNHO CONFIRMA", centerX, 219);
+  g_tft.setTextDatum(TL_DATUM);
+}
+
+void drawSystemScreen() {
+  g_tft.fillScreen(kBackgroundColor);
+  g_tft.setTextDatum(MC_DATUM);
+  const int16_t centerX = g_tft.width() / 2;
+  g_tft.setTextColor(kEyeColor, kBackgroundColor);
+  g_tft.setTextSize(2);
+  g_tft.drawString("SISTEMA", centerX, 24);
+  g_tft.setTextSize(1);
+  g_tft.setTextColor(kMenuAccentColor, kBackgroundColor);
+  g_tft.drawString("CPU", 48, 78);
+  g_tft.drawString(String(g_systemCpu, 1) + "%", 177, 78);
+  g_tft.drawString("RAM", 48, 122);
+  g_tft.drawString(String(g_systemMemory, 1) + "%", 177, 122);
+  g_tft.drawString("TEMP", 48, 166);
+  g_tft.drawString(g_systemTemperatureValid ? String(g_systemTemperature, 1) + " C" : "--", 177, 166);
+  g_tft.setTextColor(kEyeColor, kBackgroundColor);
+  g_tft.drawString("STATUS:TEXT para voltar", centerX, 228);
   g_tft.setTextDatum(TL_DATUM);
 }
 
@@ -561,6 +630,7 @@ void processCommand(String line) {
   if (line == "MODE:MENU") {
     g_menuVisible = true;
     g_modeScreenVisible = false;
+    g_systemScreenVisible = false;
     g_menuIndex = 1;
     g_idlePhase = -1;
     drawMenu();
@@ -569,12 +639,14 @@ void processCommand(String line) {
   if (line == "MODE:FACE") {
     g_menuVisible = false;
     g_modeScreenVisible = false;
+    g_systemScreenVisible = false;
     drawFace(g_lastBlinking);
     return;
   }
   if (line.startsWith("MODE:")) {
     g_menuVisible = false;
     g_modeScreenVisible = true;
+    g_systemScreenVisible = false;
     const String mode = line.substring(5);
     if (mode == "FOLLOW_HAND") g_menuIndex = 0;
     else if (mode == "FOLLOW_FACE") g_menuIndex = 1;
@@ -585,8 +657,29 @@ void processCommand(String line) {
     else if (mode == "YOUTUBE") g_menuIndex = 6;
     else if (mode == "SPOTIFY") g_menuIndex = 7;
     else if (mode == "BROWSER") g_menuIndex = 8;
+    else if (mode == "SYSTEM") g_menuIndex = 9;
     g_statusText = "Ativo";
     drawModeScreen();
+    return;
+  }
+  if (line == "SCREEN:SYSTEM") {
+    g_menuVisible = false;
+    g_modeScreenVisible = false;
+    g_systemScreenVisible = true;
+    drawSystemScreen();
+    return;
+  }
+  if (line.startsWith("SYSTEM:CPU:")) {
+    const int firstSeparator = line.indexOf(':', 11);
+    const int secondSeparator = line.indexOf(':', firstSeparator + 1);
+    if (firstSeparator > 0 && secondSeparator > firstSeparator) {
+      g_systemCpu = line.substring(11, firstSeparator).toFloat();
+      g_systemMemory = line.substring(firstSeparator + 1, secondSeparator).toFloat();
+      const String temperature = line.substring(secondSeparator + 1);
+      g_systemTemperatureValid = temperature != "--";
+      g_systemTemperature = temperature.toFloat();
+      if (g_systemScreenVisible) drawSystemScreen();
+    }
     return;
   }
   if (line.startsWith("STATUS:TEXT:")) {
@@ -641,6 +734,7 @@ void processCommand(String line) {
   if (line == "MENU:CANCEL") {
     g_menuVisible = false;
     g_modeScreenVisible = false;
+    g_systemScreenVisible = false;
     drawFace(g_lastBlinking);
     return;
   }
